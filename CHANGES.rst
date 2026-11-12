@@ -1,3 +1,15 @@
+Unreleased - Device capabilities
+--------------------------------------------------------------------------------
+
+- Add optional device capability authorization. Applications configure the
+  ``OTP_DEVICE_CAPABILITIES`` callable to map a device to capability strings;
+  ``otp_required(device_capabilities=...)`` and
+  ``user.is_verified(capabilities)`` then only accept sessions verified by a
+  device that provides them. The decision is re-evaluated against the actual
+  device on every request, and ``LoginView`` limits the re-verification form
+  to suitable devices.
+
+
 v1.7.5 - October 16, 2026 - Revoke sessions for unconfirmed devices
 --------------------------------------------------------------------------------
 

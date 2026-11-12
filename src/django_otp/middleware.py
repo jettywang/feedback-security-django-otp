@@ -5,11 +5,33 @@ from asgiref.sync import iscoroutinefunction, markcoroutinefunction
 from django.utils.functional import SimpleLazyObject
 
 from django_otp import DEVICE_ID_SESSION_KEY
+from django_otp.capabilities import (
+    adevice_has_capabilities,
+    device_has_capabilities,
+)
 from django_otp.models import Device
 
 
-def is_verified(user):
-    return user.otp_device is not None
+def is_verified(user, device_capabilities=None):
+    if user.otp_device is None:
+        return False
+
+    if device_capabilities:
+        return device_has_capabilities(user.otp_device, device_capabilities)
+
+    return True
+
+
+async def ais_verified(user, device_capabilities=None):
+    if user.otp_device is None:
+        return False
+
+    if device_capabilities:
+        return await adevice_has_capabilities(
+            user.otp_device, device_capabilities
+        )
+
+    return True
 
 
 class OTPMiddleware:
@@ -22,6 +44,14 @@ class OTPMiddleware:
     object that has verified the user, or ``None`` if the user has not been
     verified.  As a convenience, this also installs ``user.is_verified()``,
     which returns ``True`` if ``user.otp_device`` is not ``None``.
+
+    Both ``user.is_verified()`` and the asynchronous ``user.ais_verified()``
+    accept an optional sequence of device capabilities. When given, they only
+    report the user as verified if the device that established the current
+    session actually provides those capabilities (see
+    :mod:`django_otp.capabilities`). Because the device is reloaded and
+    re-evaluated on every request, a session that loses its qualifying device
+    is rejected on the next request.
 
     This middleware is async capable. It wraps ``request.auser()`` similarly
     to ``request.user`` as described above.
@@ -64,6 +94,7 @@ class OTPMiddleware:
     def _init_user_fields(user):
         user.otp_device = None
         user.is_verified = functools.partial(is_verified, user)
+        user.ais_verified = functools.partial(ais_verified, user)
 
     @staticmethod
     def _normalize_persistent_id(persistent_id: str) -> str:

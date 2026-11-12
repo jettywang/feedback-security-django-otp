@@ -24,6 +24,11 @@ urlpatterns = [
     path('require-login/', views.require_login, name='require-login'),
     path('require-otp/', views.require_otp, name='require-otp'),
     path('require-login-then-otp/', views.require_login_then_otp, name='require-login-then-otp'),
+    path(
+        'require-transfer/',
+        views.require_transfer_capability,
+        name='require-transfer',
+    ),
 
     path('admin/', admin.site.urls),
     path('otpadmin/', otp_admin_site.urls),

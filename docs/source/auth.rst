@@ -196,7 +196,7 @@ both verified and unverified users on your site, you're probably intending to
 limit access to some resources to verified users only. The primary tool for this
 is otp_required:
 
-.. decorator:: django_otp.decorators.otp_required([redirect_field_name='next', login_url=None, if_configured=False])
+.. decorator:: django_otp.decorators.otp_required([redirect_field_name='next', login_url=None, if_configured=False, device_capabilities=None])
 
     Similar to :func:`~django.contrib.auth.decorators.login_required`, but
     requires the user to be :term:`verified`. By default, this redirects users
@@ -206,12 +206,76 @@ is otp_required:
         OTP devices will be allowed. Default is ``False``.
     :type if_configured: bool
 
+    :param device_capabilities: An optional capability string or iterable of
+        capability strings. When given, the device that verified the current
+        session must provide every one of them (see
+        :ref:`device-capabilities`). A session verified by an unsuitable device
+        is treated as unverified and redirected.
+    :type device_capabilities: str or iterable of str
+
 If you need more fine-grained control over authorization decisions, you can use
 ``request.user.is_verified()`` to determine whether the user has been verified
 by an OTP device. if ``is_verified()`` is true, then ``request.user.otp_device``
 will be set to the :class:`~django_otp.models.Device` object that verified the
 user. This can be useful if you want to include the name of the verifying device
 in the UI.
+
+.. _device-capabilities:
+
+Requiring Device Capabilities
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Sometimes not every verified device is equally trusted. For example, an OTP
+delivered by email might be enough to view an account, while confirming a money
+transfer should require a dedicated, registered device. django-otp models this
+with *capabilities*: opaque strings, whose meaning is defined by your
+application, that describe what a device can be used for.
+
+Tell django-otp how to derive the capabilities of a device by configuring the
+:setting:`OTP_DEVICE_CAPABILITIES` setting with a callable::
+
+    # settings.py
+    def device_capabilities(device):
+        from django_otp.plugins.otp_totp.models import TOTPDevice
+
+        if isinstance(device, TOTPDevice):
+            return ['transfer']
+        return []
+
+    OTP_DEVICE_CAPABILITIES = device_capabilities
+
+The callable receives a :class:`~django_otp.models.Device` and returns a single
+capability string or an iterable of capability strings. It may also be a
+coroutine function, in which case it is consumed by the asynchronous APIs.
+
+A view then declares the capabilities it needs::
+
+    from django_otp.decorators import otp_required
+
+    @otp_required(device_capabilities='transfer')
+    def transfer(request):
+        ...
+
+The decision is always made against the device that actually verified the
+current session, so a previously verified session is re-evaluated on every
+request. You can make the same check directly with
+``request.user.is_verified('transfer')`` (or the asynchronous
+``await request.user.ais_verified('transfer')``). When the verifying device is
+deleted, unconfirmed, or otherwise loses the required capability, the next
+request no longer passes.
+
+On redirect, :func:`~django_otp.decorators.otp_required` stashes the required
+capabilities in the session. :class:`~django_otp.views.LoginView` picks them up
+and limits :class:`~django_otp.forms.OTPTokenForm` to devices that provide them,
+so the re-verification page only offers suitable devices. Once the user
+verifies again with a qualifying device, both ordinary and capability-protected
+views are reachable; the stashed capabilities are cleared on success.
+
+The lower level helpers live in :mod:`django_otp.capabilities` and are also
+exported from the ``django_otp`` package:
+
+.. automodule:: django_otp.capabilities
+    :members:
 
 If you want to use OTPs to establish trusted user agents (e.g. a browser that
 the user claims is on a private and secure computer), look at

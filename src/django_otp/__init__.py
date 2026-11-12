@@ -1,7 +1,37 @@
 from django.contrib.auth.signals import user_logged_in
 from django.db import transaction
 
+from .capabilities import (
+    adevice_has_capabilities,
+    aget_device_capabilities,
+    as_capability_set,
+    device_has_capabilities,
+    devices_with_capabilities,
+    get_device_capabilities,
+)
+
 DEVICE_ID_SESSION_KEY = 'otp_device_id'
+# Capabilities a re-verification view must be able to satisfy. Set by
+# otp_required() when it bounces a session that was verified by an
+# insufficiently capable device.
+REQUIRED_DEVICE_CAPABILITIES_SESSION_KEY = 'otp_required_device_capabilities'
+
+__all__ = [
+    'DEVICE_ID_SESSION_KEY',
+    'REQUIRED_DEVICE_CAPABILITIES_SESSION_KEY',
+    'adevice_has_capabilities',
+    'aget_device_capabilities',
+    'as_capability_set',
+    'device_has_capabilities',
+    'devices_for_user',
+    'devices_with_capabilities',
+    'device_classes',
+    'get_device_capabilities',
+    'login',
+    'match_token',
+    'user_has_device',
+    'verify_token',
+]
 
 
 def login(request, device):

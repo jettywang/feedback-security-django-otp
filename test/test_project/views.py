@@ -28,3 +28,9 @@ def require_otp(request):
 @otp_required
 def require_login_then_otp(request):
     return HttpResponseRedirect(reverse('home'))
+
+
+@login_required
+@otp_required(device_capabilities='transfer')
+def require_transfer_capability(request):
+    return HttpResponseRedirect(reverse('home'))

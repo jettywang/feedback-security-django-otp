@@ -6,7 +6,8 @@ from django.dispatch import Signal
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext_lazy
 
-from . import devices_for_user
+from . import devices_for_user, devices_with_capabilities
+from .capabilities import device_has_capabilities
 from .models import Device, VerifyNotAllowed
 
 otp_verification_failed = Signal()
@@ -79,6 +80,11 @@ class OTPAuthenticationFormMixin:
         'device_required': _('Please select a device.'),
     }
 
+    # Optional iterable of device capabilities used to filter the presented
+    # device choices. Subclasses or callers can populate this (e.g.
+    # OTPTokenForm accepts it as a constructor argument).
+    device_capabilities = None
+
     def clean_otp(self, user):
         """
         Processes the ``otp_*`` fields.
@@ -134,6 +140,17 @@ class OTPAuthenticationFormMixin:
         # following, an attacker could authenticate using some other user's OTP
         # device.
         if (device is not None) and (device.user_id != user.pk):
+            device = None
+
+        # SECURITY: the choices are limited to capable devices, but a client
+        # can still submit any persistent id. Treat a device that lacks the
+        # capabilities this verification step requires as not chosen, so the
+        # normal "explicit device required" rejection applies.
+        if (
+            (device is not None)
+            and self.device_capabilities
+            and not device_has_capabilities(device, self.device_capabilities)
+        ):
             device = None
 
         return device
@@ -202,17 +219,22 @@ class OTPAuthenticationFormMixin:
 
     def _update_form(self, user):
         if 'otp_device' in self.fields:
-            self.fields['otp_device'].widget.choices = self.device_choices(user)
+            self.fields['otp_device'].widget.choices = self.device_choices(
+                user, self.device_capabilities
+            )
 
         if 'password' in self.fields:
             self.fields['password'].widget.render_value = True
 
     @staticmethod
-    def device_choices(user):
+    def device_choices(user, device_capabilities=None):
         # Without a blank entry, a <select> always submits a real device by default.
-        return BLANK_CHOICE_DASH + list(
-            (d.persistent_id, d.name) for d in devices_for_user(user)
-        )
+        devices = devices_for_user(user)
+        if device_capabilities:
+            devices = devices_with_capabilities(devices, device_capabilities)
+        return BLANK_CHOICE_DASH + [
+            (d.persistent_id, d.name) for d in devices
+        ]
 
 
 class OTPAuthenticationForm(OTPAuthenticationFormMixin, AuthenticationForm):
@@ -329,6 +351,10 @@ class OTPTokenForm(OTPAuthenticationFormMixin, forms.Form):
     :param request: The current request.
     :type request: :class:`~django.http.HttpRequest`
 
+    :param device_capabilities: An optional capability string or iterable of
+        capability strings. When provided, only devices offering those
+        capabilities (per :setting:`OTP_DEVICE_CAPABILITIES`) are offered as
+        choices, so a re-verification step can be limited to suitable devices.
     """
 
     otp_device = forms.ChoiceField(choices=[])
@@ -337,11 +363,21 @@ class OTPTokenForm(OTPAuthenticationFormMixin, forms.Form):
     )
     otp_challenge = forms.CharField(required=False)
 
-    def __init__(self, user, request=None, *args, **kwargs):
+    def __init__(
+        self,
+        user,
+        request=None,
+        *args,
+        device_capabilities=None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
 
         self.user = user
-        self.fields['otp_device'].choices = self.device_choices(user)
+        self.device_capabilities = device_capabilities
+        self.fields['otp_device'].choices = self.device_choices(
+            user, device_capabilities
+        )
 
     def clean(self):
         super().clean()

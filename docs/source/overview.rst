@@ -548,6 +548,19 @@ The URL where requests are redirected for two-factor authentication, especially
 when using the :func:`~django_otp.decorators.otp_required` decorator.
 
 
+.. setting:: OTP_DEVICE_CAPABILITIES
+
+**OTP_DEVICE_CAPABILITIES**
+
+Default: ``None``
+
+A callable that maps a :class:`~django_otp.models.Device` to the capabilities
+it provides. It is called with a single device argument and must return a
+capability string or an iterable of capability strings. It may be a coroutine
+function, which is consumed by the asynchronous APIs. When unset, devices have
+no capabilities and capability checks (see :ref:`device-capabilities`) fail.
+
+
 .. setting:: OTP_ADMIN_HIDE_SENSITIVE_DATA
 
 **OTP_ADMIN_HIDE_SENSITIVE_DATA**
@@ -567,6 +580,13 @@ Glossary
     authenticated
         A user whose credentials have been accepted by Django's authentication
         API is considered authenticated.
+
+    capability
+        An application-defined string describing something a registered
+        device can be used for, such as authorizing a transfer. django-otp
+        compares the capabilities required by a view with those provided by
+        the device that verified the current session; the meaning of each
+        capability string is left entirely to the application.
 
     device
         A mechanism by which a user can acquire an OTP. This might correspond to
