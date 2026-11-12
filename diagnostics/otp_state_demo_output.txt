@@ -1,0 +1,95 @@
+
+========================================================================
+第一部分 HOTP：counter / tolerance 如何更新（虚构设备 HOTP-FIC-001）
+========================================================================
+
+场景 A 正常同步：设备按顺序出码，服务端在容差窗口内追上计数器
+  [初始] counter=0   tolerance=5 fail_count=0 last_used_at=null
+  -> 提交令牌 359152（设备显示 counter=2 的码，服务端还停在 0）：接受
+  [接受后] counter=3   tolerance=5 fail_count=0 last_used_at=set
+     规则：命中 counter=2 后，服务端 counter 直接跳到 2+1=3（一次性补齐）
+  -> 提交令牌 969429（下一个码 counter=3，正好等于服务端预期）：接受
+  [再接受后] counter=4   tolerance=5 fail_count=0 last_used_at=set
+
+场景 B 重放保护：同一个 HOTP 码不能再用第二次（计数器只增）
+  -> 提交令牌 969429（重复提交上一个已接受的码）：拒绝
+  [重放被拒后] counter=4   tolerance=5 fail_count=1 last_used_at=set
+
+场景 C 超出容差：设备被按得太多，偏移超过 tolerance，同步失败
+  [初始，服务端 counter=10，tolerance=5 -> 窗口 10..15] counter=10  tolerance=5 fail_count=0 last_used_at=null
+  -> 提交令牌 328281（设备码对应 counter=20，落在窗口外）：拒绝
+  [拒绝后，counter 保持不变] counter=10  tolerance=5 fail_count=1 last_used_at=null
+     规则：窗口内无匹配 => counter 不动，失败只累加节流计数。
+     HOTP 无自动重对齐：要么人工把 counter 校到设备附近，要么重新配对。
+
+场景 D 设备计数器反而落后于服务端（常见于换设备/设备被重置）
+  [服务端 counter=8 -> 窗口 8..13，只会向更大值找] counter=8   tolerance=5 fail_count=0 last_used_at=null
+  -> 提交令牌 338314（设备码对应 counter=4，小于服务端 counter）：拒绝
+  [拒绝后] counter=8   tolerance=5 fail_count=1 last_used_at=null
+     规则：range 只从 self.counter 向上找，旧计数器无法把服务端拉回；
+     两侧已不是同一条计数序列，通常意味着密钥/设备不一致，需重新配对。
+
+========================================================================
+第二部分 TOTP：tolerance / drift / last_t 如何更新（虚构设备 TOTP-FIC-101）
+========================================================================
+
+固定时钟：epoch=1700000040，当前服务端时间步 t_now=56666668，step=30s
+
+场景 A 正常同步：设备时钟慢 1 步，容差=1 内命中并自动学习 drift
+  [初始] drift=0   last_t=-1  tolerance=1 fail_count=0 last_used_at=null
+  -> 提交令牌 732303（设备慢 1 步显示的码）：接受
+  [接受后] drift=-1  last_t=56666667 tolerance=1 fail_count=0 last_used_at=set
+     规则：TOTP.verify 用 drift+offset 命中后，drift 更新为 -1，
+     last_t 更新为命中的时间步；之后即便 tolerance 调小也能对上。
+  -> 提交令牌 136087（30 秒后新码，drift 已记住慢 1 步）：接受
+  [再接受后] drift=-1  last_t=56666668 tolerance=0 fail_count=0 last_used_at=set
+
+场景 B 重放保护：同一时间步的码不能用两次（last_t 只接受更大的 t）
+  -> 提交令牌 136087（重复提交刚用过的同一步码）：拒绝
+  [重放被拒后，last_t 不变] drift=-1  last_t=56666668 tolerance=0 fail_count=1 last_used_at=set
+
+场景 C 客户现场：校准 drift 后“立刻”仍失败——last_t 卡住当前步
+  [上次成功登录：drift=-1，last_t 停在被接受的时间步] drift=-1  last_t=56666667 tolerance=1 fail_count=0 last_used_at=null
+  -> 提交令牌 732303（同一窗口内用校准前的旧码立即重试）：拒绝
+  [被拒：该 t 已 <= last_t，drift 改对了也没用] drift=0   last_t=56666667 tolerance=1 fail_count=1 last_used_at=null
+     关键：重新校准只改 drift，不会回退 last_t。需等到下一个 30 秒窗口，
+     用新时间步（t > last_t）的码提交才能恢复——这就是‘不能立即恢复’。
+  -> 提交令牌 253938（等到下一窗口，用新码提交）：接受
+  [接受后恢复正常] drift=0   last_t=56666669 tolerance=1 fail_count=0 last_used_at=set
+
+场景 D 超出容差：设备时钟偏移 >= 2 步，tolerance=1 无法覆盖，需重新配对
+  [初始，窗口仅覆盖 t-1..t+1] drift=0   last_t=-1  tolerance=1 fail_count=0 last_used_at=null
+  -> 提交令牌 921300（设备慢 2 步的码，超出 ±1 容差）：拒绝
+  [拒绝：drift 保持 0，last_t 保持 -1，状态完全没动] drift=0   last_t=-1  tolerance=1 fail_count=1 last_used_at=null
+     规则：TOTP.verify 遍历完容差区间都不匹配时会把 drift 还原；
+     OTP_TOTP_SYNC 只能在容差内学习，偏出容差永远学不会，需重新配对/纠正时钟。
+
+场景 E OTP_TOTP_SYNC=False：可凭容差临时通过，但不学习漂移，问题会反复
+  -> 提交令牌 732303（设备慢 1 步，容差内可通过）：接受
+  [接受但 drift 仍为 0（未学习），换个时刻仍可能失败] drift=0   last_t=56666667 tolerance=1 fail_count=0 last_used_at=set
+     规则：SYNC 关闭时 verify_token 不回写 drift，靠容差兜底而非真正对齐。
+
+========================================================================
+第三部分 节流 ThrottlingMixin：失败计数与退避（两种设备逻辑相同）
+========================================================================
+
+连续错误码累积 failure_count，并产生指数退避 1,2,4,8... 秒
+（演示中把失败时间戳回拨，模拟每个退避窗口已过，从而连续触发计数累加）
+  -> 提交令牌 516516（错误码（故意不匹配））：拒绝
+     失败后 failure_count=1，下次提交需等待 1 秒（factor=1 的 2^(n-1) 退避）
+  -> 提交令牌 516516（错误码（故意不匹配））：拒绝
+     失败后 failure_count=2，下次提交需等待 2 秒（factor=1 的 2^(n-1) 退避）
+  -> 提交令牌 516516（错误码（故意不匹配））：拒绝
+     失败后 failure_count=3，下次提交需等待 4 秒（factor=1 的 2^(n-1) 退避）
+
+处于退避窗口内时，verify_is_allowed 直接拦截，连校验都不会进入：
+     verify_is_allowed -> 拒绝，failure_count=3，locked_until=08:54:54
+
+退避窗口过去后令牌正确，一次成功即清零失败计数与时间戳：
+     退避窗口过后 verify_is_allowed -> 允许
+  -> 提交令牌 755224（窗口过后提交正确码）：接受
+  [成功后 fail_count 清零、时间戳置空] counter=1   tolerance=5 fail_count=0 last_used_at=set
+
+========================================================================
+演示结束：全程未连接数据库、未打印密钥；设备/用户均为虚构。
+========================================================================
