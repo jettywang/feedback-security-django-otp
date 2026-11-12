@@ -450,6 +450,115 @@ class OTPMiddlewareAsyncTestCase(TestCase):
         pickle.dumps(user)
 
 
+class DeviceIdFormatTestCase(TestCase):
+    """
+    Reading and writing of the legacy (v1) and versioned (v2) device id
+    formats across the deployment window.
+    """
+
+    def setUp(self):
+        self.factory = RequestFactory()
+        try:
+            self.alice = self.create_user('alice', 'password')
+        except IntegrityError:
+            self.skipTest("Unable to create a test user.")
+        else:
+            self.device = self.alice.staticdevice_set.create()
+
+        self.middleware = OTPMiddleware(lambda r: None)
+        self.legacy_id = 'otp_static.staticdevice/{0}'.format(self.device.id)
+        self.v2_id = 'v2:otp_static.staticdevice:{0}'.format(self.device.id)
+
+    def _run_middleware(self, session):
+        request = self.factory.get('/')
+        request.user = self.alice
+        request.session = session
+
+        self.middleware(request)
+
+        return request
+
+    def test_persistent_id_defaults_to_v2(self):
+        self.assertEqual(self.device.persistent_id, self.v2_id)
+
+    @override_settings(OTP_DEVICE_ID_FORMAT='legacy')
+    def test_persistent_id_legacy_mode(self):
+        self.assertEqual(self.device.persistent_id, self.legacy_id)
+
+    def test_from_persistent_id_reads_both_formats(self):
+        from django_otp.models import Device
+
+        self.assertEqual(Device.from_persistent_id(self.v2_id), self.device)
+        self.assertEqual(Device.from_persistent_id(self.legacy_id), self.device)
+
+    @override_settings(OTP_DEVICE_ID_FORMAT='legacy')
+    def test_legacy_mode_rejects_v2(self):
+        from django_otp.models import Device
+
+        self.assertEqual(Device.from_persistent_id(self.legacy_id), self.device)
+        self.assertIsNone(Device.from_persistent_id(self.v2_id))
+
+    @override_settings(OTP_DEVICE_ID_FORMAT='new')
+    def test_new_mode_rejects_legacy(self):
+        from django_otp.models import Device
+
+        self.assertEqual(Device.from_persistent_id(self.v2_id), self.device)
+        self.assertIsNone(Device.from_persistent_id(self.legacy_id))
+
+    def test_old_session_is_migrated(self):
+        session = {DEVICE_ID_SESSION_KEY: self.legacy_id}
+
+        request = self._run_middleware(session)
+
+        self.assertTrue(request.user.is_verified())
+        self.assertEqual(session[DEVICE_ID_SESSION_KEY], self.v2_id)
+
+    def test_new_session_is_left_alone(self):
+        session = {DEVICE_ID_SESSION_KEY: self.v2_id}
+
+        request = self._run_middleware(session)
+
+        self.assertTrue(request.user.is_verified())
+        self.assertEqual(session[DEVICE_ID_SESSION_KEY], self.v2_id)
+
+    def test_deleted_device_revokes_old_session(self):
+        session = {DEVICE_ID_SESSION_KEY: self.legacy_id}
+        self.device.delete()
+
+        request = self._run_middleware(session)
+
+        self.assertFalse(request.user.is_verified())
+        self.assertNotIn(DEVICE_ID_SESSION_KEY, session)
+
+    def test_deleted_device_revokes_new_session(self):
+        session = {DEVICE_ID_SESSION_KEY: self.v2_id}
+        self.device.delete()
+
+        request = self._run_middleware(session)
+
+        self.assertFalse(request.user.is_verified())
+        self.assertNotIn(DEVICE_ID_SESSION_KEY, session)
+
+    def test_unconfirmed_device_is_not_migrated(self):
+        self.device.confirmed = False
+        self.device.save(update_fields=['confirmed'])
+        session = {DEVICE_ID_SESSION_KEY: self.legacy_id}
+
+        request = self._run_middleware(session)
+
+        self.assertFalse(request.user.is_verified())
+        self.assertNotIn(DEVICE_ID_SESSION_KEY, session)
+
+    @override_settings(OTP_DEVICE_ID_FORMAT='legacy')
+    def test_legacy_mode_keeps_legacy_session(self):
+        session = {DEVICE_ID_SESSION_KEY: self.legacy_id}
+
+        request = self._run_middleware(session)
+
+        self.assertTrue(request.user.is_verified())
+        self.assertEqual(session[DEVICE_ID_SESSION_KEY], self.legacy_id)
+
+
 class LoginViewTestCase(TestCase):
     def setUp(self):
         try:

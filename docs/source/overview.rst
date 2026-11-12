@@ -559,6 +559,32 @@ and corresponding QR codes, static tokens). Note, it is respected by built-in
 plugins, but external ones may or may not support it.
 
 
+.. setting:: OTP_DEVICE_ID_FORMAT
+
+**OTP_DEVICE_ID_FORMAT**
+
+Default: ``'migrate'``
+
+Controls the format of :attr:`~django_otp.models.Device.persistent_id`, the
+device identifier stored in the session and used by forms and APIs. The
+historical format is ``"<app_label>.<model_name>/<id>"`` (v1); the current
+format is ``"v2:<app_label>.<model_name>:<id>"`` (v2). Three modes support a
+staged rollout:
+
+- ``'legacy'``: read and write only the v1 format. Use this while old and new
+  code run side by side, since older versions cannot parse v2 ids.
+- ``'migrate'``: read both formats, write v2. Sessions still holding a v1 id
+  are transparently rewritten to v2 by
+  :class:`~django_otp.middleware.OTPMiddleware` once the device's ownership
+  and confirmation status have been verified.
+- ``'new'``: read and write only v2. Use this once every session has had time
+  to be migrated (or expire).
+
+A safe rolling upgrade looks like: deploy the new version with
+``'legacy'`` everywhere, switch to ``'migrate'`` once all servers run the new
+version, then switch to ``'new'`` after your session lifetime has elapsed.
+
+
 Glossary
 --------
 

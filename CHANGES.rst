@@ -1,3 +1,15 @@
+Unreleased
+--------------------------------------------------------------------------------
+
+- Device persistent ids now use a versioned format
+  (``v2:<app_label>.<model_name>:<id>``). The new
+  :setting:`OTP_DEVICE_ID_FORMAT` setting (``'legacy'``, ``'migrate'``,
+  ``'new'``) controls which formats are read and written, allowing a staged
+  rollout. In the default ``'migrate'`` mode, both formats are accepted and
+  sessions holding a legacy id are rewritten to the new format once device
+  ownership and confirmation have been verified.
+
+
 v1.7.5 - October 16, 2026 - Revoke sessions for unconfirmed devices
 --------------------------------------------------------------------------------
 

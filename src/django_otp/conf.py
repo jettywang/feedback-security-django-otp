@@ -14,6 +14,7 @@ class Settings:
         return {
             'OTP_LOGIN_URL': django.conf.settings.LOGIN_URL,
             'OTP_ADMIN_HIDE_SENSITIVE_DATA': False,
+            'OTP_DEVICE_ID_FORMAT': 'migrate',
         }
 
     def __getattr__(self, name):

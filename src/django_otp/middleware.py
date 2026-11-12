@@ -87,8 +87,14 @@ class OTPMiddleware:
         ):
             device = None
 
-        if (device is None) and (DEVICE_ID_SESSION_KEY in request.session):
-            del request.session[DEVICE_ID_SESSION_KEY]
+        if device is None:
+            if DEVICE_ID_SESSION_KEY in request.session:
+                del request.session[DEVICE_ID_SESSION_KEY]
+        elif request.session.get(DEVICE_ID_SESSION_KEY) != device.persistent_id:
+            # The session holds a device id in a superseded format. Ownership
+            # and confirmation have just been verified, so it is safe to
+            # migrate the session to the current format.
+            request.session[DEVICE_ID_SESSION_KEY] = device.persistent_id
 
         return device
 

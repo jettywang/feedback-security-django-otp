@@ -4,10 +4,12 @@ import enum
 
 from django.apps import apps
 from django.conf import settings
-from django.core.exceptions import ObjectDoesNotExist
+from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
 from django.db import models
 from django.utils import timezone
 from django.utils.functional import cached_property
+
+from django_otp.conf import settings as otp_settings
 
 from .util import random_number_token
 
@@ -16,6 +18,28 @@ from .util import random_number_token
 # something that's already far longer than any realistic lockout needs to
 # be, rather than let the delay calculation overflow.
 MAX_THROTTLE_DELAY_SECONDS = timedelta(days=365 * 100).total_seconds()
+
+# Persistent id formats. Version 1 is the historical
+# "<app_label>.<model_name>/<id>" form. Version 2 adds a prefix and uses
+# colons so that the two formats can never be confused for one another.
+PERSISTENT_ID_V2_PREFIX = 'v2'
+
+DEVICE_ID_FORMATS = ('legacy', 'migrate', 'new')
+
+
+def device_id_format():
+    """
+    Returns the configured :setting:`OTP_DEVICE_ID_FORMAT` value, validating
+    it against the supported modes.
+    """
+    fmt = otp_settings.OTP_DEVICE_ID_FORMAT
+    if fmt not in DEVICE_ID_FORMATS:
+        raise ImproperlyConfigured(
+            "OTP_DEVICE_ID_FORMAT must be one of {0}, got {1!r}.".format(
+                DEVICE_ID_FORMATS, fmt
+            )
+        )
+    return fmt
 
 
 class DeviceManager(models.Manager):
@@ -114,7 +138,22 @@ class Device(models.Model):
     def persistent_id(self):
         """
         A stable device identifier for forms and APIs.
+
+        The written format is controlled by
+        :setting:`OTP_DEVICE_ID_FORMAT`: ``'legacy'`` writes the historical
+        ``"<app_label>.<model_name>/<id>"`` form, while ``'migrate'`` and
+        ``'new'`` write the versioned ``"v2:<app_label>.<model_name>:<id>"``
+        form.
+
         """
+        if device_id_format() == 'legacy':
+            return self._legacy_persistent_id
+        return '{0}:{1}:{2}'.format(
+            PERSISTENT_ID_V2_PREFIX, self.model_label(), self.id
+        )
+
+    @property
+    def _legacy_persistent_id(self):
         return '{0}/{1}'.format(self.model_label(), self.id)
 
     @classmethod
@@ -152,7 +191,7 @@ class Device(models.Model):
 
     @classmethod
     def _filter_persistent_id(cls, persistent_id, for_verify=False):
-        model_label, device_id = persistent_id.rsplit("/", 1)
+        model_label, device_id = cls._parse_persistent_id(persistent_id)
         app_label, model_name = model_label.split(".")
 
         device_cls = apps.get_model(app_label, model_name)
@@ -162,6 +201,35 @@ class Device(models.Model):
                 device_set = device_set.select_for_update()
             return device_set
         return None
+
+    @classmethod
+    def _parse_persistent_id(cls, persistent_id):
+        """
+        Splits a persistent id into a ``(model_label, device_id)`` pair,
+        honoring :setting:`OTP_DEVICE_ID_FORMAT`.
+
+        ``'legacy'`` accepts only the historical ``model_label/id`` form,
+        ``'new'`` accepts only the versioned ``v2:model_label:id`` form, and
+        ``'migrate'`` accepts both. Raises :exc:`ValueError` for anything
+        else, which callers treat as an unknown device.
+
+        """
+        fmt = device_id_format()
+
+        parts = persistent_id.split(':')
+        if len(parts) == 3 and parts[0] == PERSISTENT_ID_V2_PREFIX:
+            if fmt == 'legacy':
+                raise ValueError(
+                    "Versioned device ids are not accepted in 'legacy' mode."
+                )
+            return parts[1], parts[2]
+
+        if fmt == 'new':
+            raise ValueError(
+                "Legacy device ids are not accepted in 'new' mode."
+            )
+
+        return persistent_id.rsplit("/", 1)
 
     def is_interactive(self):
         """
