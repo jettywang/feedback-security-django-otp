@@ -1,8 +1,10 @@
 from datetime import timedelta
+from smtplib import SMTPException
 
 from freezegun import freeze_time
 
 from django.core import mail
+from django.core.mail.backends.base import BaseEmailBackend
 from django.db import IntegrityError
 from django.test.utils import override_settings
 
@@ -247,6 +249,149 @@ class EmailTest(EmailDeviceMixin, TestCase):
 
         self.assertEqual(len(mail.outbox), 1)
         self.assertEqual(mail.outbox[0].to, ['alice2@example.com'])
+
+
+class ControllableEmailBackend(BaseEmailBackend):
+    """
+    A test email backend that records sent messages and can be told to fail.
+
+    Delivery is controlled through class attributes so tests can toggle
+    failures between requests:
+
+    .. attribute:: outbox
+
+        A list of all messages sent so far.
+
+    .. attribute:: fail_with
+
+        If not ``None``, the exception to raise from ``send_messages``.
+
+    """
+
+    outbox = []
+    fail_with = None
+
+    @classmethod
+    def reset(cls):
+        cls.outbox = []
+        cls.fail_with = None
+
+    def send_messages(self, email_messages):
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.__class__.outbox.extend(email_messages)
+        return len(email_messages)
+
+
+@override_settings(
+    EMAIL_BACKEND='django_otp.plugins.otp_email.tests.ControllableEmailBackend',
+    OTP_EMAIL_COOLDOWN_DURATION=10,
+    OTP_EMAIL_THROTTLE_FACTOR=0,
+)
+class FailedDeliveryTestCase(EmailDeviceMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        ControllableEmailBackend.reset()
+
+    def test_failed_first_generation_leaves_no_trace(self):
+        """
+        If delivery fails on the first challenge, nothing is committed: no
+        token, no cooldown, so the user may retry immediately.
+        """
+        ControllableEmailBackend.fail_with = SMTPException("backend down")
+
+        with self.assertRaises(SMTPException):
+            self.device.generate_challenge()
+
+        self.device.refresh_from_db()
+        self.assertIsNone(self.device.token)
+        self.assertIsNone(self.device.last_generated_timestamp)
+        self.assertEqual(ControllableEmailBackend.outbox, [])
+
+        allowed, _ = self.device.generate_is_allowed()
+        self.assertTrue(allowed)
+
+    def test_retry_after_failure_succeeds_immediately(self):
+        """
+        A failed challenge does not impose a cooldown: an immediate retry
+        delivers the token and records the generation.
+        """
+        ControllableEmailBackend.fail_with = SMTPException("backend down")
+        with self.assertRaises(SMTPException):
+            self.device.generate_challenge()
+
+        ControllableEmailBackend.fail_with = None
+        message = self.device.generate_challenge()
+
+        self.assertEqual(message, "sent by email")
+        self.assertEqual(len(ControllableEmailBackend.outbox), 1)
+        self.device.refresh_from_db()
+        self.assertIsNotNone(self.device.token)
+        self.assertIsNotNone(self.device.last_generated_timestamp)
+
+    def test_failed_regeneration_preserves_valid_token(self):
+        """
+        If a retry fails while a valid token exists, the token and the
+        cooldown timestamp are left untouched, and the next successful
+        attempt re-sends the same token.
+        """
+        with freeze_time() as frozen_time:
+            self.device.generate_challenge()
+            self.device.refresh_from_db()
+            token = self.device.token
+            generated_at = self.device.last_generated_timestamp
+
+            # Cooldown (10s) expires, token (300s) is still valid.
+            frozen_time.tick(delta=timedelta(seconds=11))
+
+            ControllableEmailBackend.fail_with = SMTPException("backend down")
+            with self.assertRaises(SMTPException):
+                self.device.generate_challenge()
+
+            self.device.refresh_from_db()
+            self.assertEqual(self.device.token, token)
+            self.assertEqual(self.device.last_generated_timestamp, generated_at)
+
+            ControllableEmailBackend.fail_with = None
+            message = self.device.generate_challenge()
+
+            self.assertEqual(message, "sent by email")
+            self.device.refresh_from_db()
+            self.assertEqual(self.device.token, token)
+            self.assertEqual(len(ControllableEmailBackend.outbox), 2)
+
+    def test_regeneration_reuses_valid_token(self):
+        """
+        Repeated challenges within the token validity period re-send the
+        same token rather than invalidating it.
+        """
+        with freeze_time() as frozen_time:
+            self.device.generate_challenge()
+            self.device.refresh_from_db()
+            token = self.device.token
+
+            frozen_time.tick(delta=timedelta(seconds=11))
+
+            self.device.generate_challenge()
+            self.device.refresh_from_db()
+            self.assertEqual(self.device.token, token)
+            self.assertEqual(len(ControllableEmailBackend.outbox), 2)
+
+    def test_regeneration_after_expiry_generates_new_token(self):
+        """
+        Once the token has expired, a new challenge generates a fresh token.
+        """
+        with freeze_time() as frozen_time:
+            self.device.generate_challenge()
+            self.device.refresh_from_db()
+            token = self.device.token
+
+            frozen_time.tick(delta=timedelta(seconds=301))
+
+            self.device.generate_challenge()
+            self.device.refresh_from_db()
+            self.assertIsNotNone(self.device.token)
+            self.assertNotEqual(self.device.token, token)
 
 
 @override_settings(

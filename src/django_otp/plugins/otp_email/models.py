@@ -3,6 +3,7 @@ from django.core.mail import send_mail
 from django.db import models
 from django.template import Context, Template
 from django.template.loader import get_template
+from django.utils import timezone
 from django.utils.translation import gettext
 
 from django_otp.models import (
@@ -83,8 +84,10 @@ class EmailDevice(TimestampMixin, CooldownMixin, ThrottlingMixin, SideChannelDev
         return message
 
     def _deliver_token(self, extra_context):
-        self.cooldown_set(commit=False)
-        self.generate_token(valid_secs=settings.OTP_EMAIL_TOKEN_VALIDITY, commit=True)
+        if self.token is None or timezone.now() > self.valid_until:
+            self.generate_token(
+                valid_secs=settings.OTP_EMAIL_TOKEN_VALIDITY, commit=False
+            )
 
         context = {'token': self.token, **(extra_context or {})}
         if settings.OTP_EMAIL_BODY_TEMPLATE:
@@ -104,6 +107,9 @@ class EmailDevice(TimestampMixin, CooldownMixin, ThrottlingMixin, SideChannelDev
             body_html = None
 
         self.send_mail(body, html_message=body_html)
+
+        self.cooldown_set(commit=False)
+        self.save()
 
         message = gettext("sent by email")
 
