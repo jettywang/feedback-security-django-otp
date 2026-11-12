@@ -364,9 +364,16 @@ Static Devices
 .. module:: django_otp.plugins.otp_static
 
 .. automodule:: django_otp.plugins.otp_static.models
-    :members: StaticDevice, StaticToken
+    :members: StaticDevice, hash_token
 
 .. autoclass:: django_otp.plugins.otp_static.admin.StaticDeviceAdmin
+
+Static tokens are never stored in plaintext. When a token is written, only the
+SHA-256 digest computed by :func:`~django_otp.plugins.otp_static.models.hash_token`
+is persisted; verification looks the digest up and consumed tokens are deleted
+as usual. Rows written by older versions may still contain the plaintext token
+in the legacy ``token`` column. They continue to verify until they are consumed
+or converted by the ``migratestatictokens`` command below.
 
 Static Settings
 '''''''''''''''
@@ -388,7 +395,22 @@ addstatictoken
 The static plugin also includes a management command called ``addstatictoken``,
 which will add a single static token to any account. This is useful for
 bootstrapping and emergency access. Run ``manage.py addstatictoken -h`` for
-details.
+details. The plaintext token is printed exactly once, because only its digest
+is saved and the code cannot be recovered afterwards.
+
+.. _migratestatictokens:
+
+migratestatictokens
+'''''''''''''''''''
+
+The ``migratestatictokens`` management command converts legacy rows that still
+store plaintext tokens to digest-only storage without touching any other data.
+It only processes rows whose digest is empty, so it is safe to re-run and to
+run while the service is serving traffic; newly written rows and rows already
+migrated are simply skipped. Use ``--limit`` to convert a batch at a time for
+gradual migration and ``--dry-run`` to report how many legacy rows remain
+without writing anything. The report contains counts and status only; no token
+values are ever printed.
 
 
 Email Devices

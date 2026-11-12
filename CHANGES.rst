@@ -1,3 +1,13 @@
+Unreleased - Hashed static tokens
+--------------------------------------------------------------------------------
+
+- Static tokens are now stored as SHA-256 digests instead of plaintext. New
+  writes persist only the digest; legacy plaintext rows continue to verify
+  until they are consumed or converted by the new ``migratestatictokens``
+  management command, which is rerunnable, supports ``--limit`` and
+  ``--dry-run``, and reports counts and status only.
+
+
 v1.7.5 - October 16, 2026 - Revoke sessions for unconfirmed devices
 --------------------------------------------------------------------------------
 

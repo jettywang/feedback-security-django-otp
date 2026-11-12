@@ -27,7 +27,11 @@ from django_otp.forms import (
     otp_verification_failed,
 )
 from django_otp.middleware import OTPMiddleware
-from django_otp.plugins.otp_static.models import StaticDevice, StaticToken
+from django_otp.plugins.otp_static.models import (
+    StaticDevice,
+    StaticToken,
+    hash_token,
+)
 
 from .test_utils import TestCase, TransactionTestCase
 
@@ -481,14 +485,13 @@ class LoginViewTestCase(TestCase):
         self.assertContains(response, 'OTP Token:')
 
         device = self.bob.staticdevice_set.get()
-        token = device.token_set.get()
         response = self.client.post(
             reverse('otpadmin:login'),
             data={
                 'username': self.bob.get_username(),
                 'password': 'password',
                 'otp_device': device.persistent_id,
-                'otp_token': token.token,
+                'otp_token': self.bob.get_username(),
                 'next': '/',
             },
         )
@@ -509,13 +512,12 @@ class LoginViewTestCase(TestCase):
 
     def test_authenticate(self):
         device = self.alice.staticdevice_set.get()
-        token = device.token_set.get()
 
         params = {
             'username': self.alice.get_username(),
             'password': 'password',
             'otp_device': device.persistent_id,
-            'otp_token': token.token,
+            'otp_token': self.alice.get_username(),
             'next': '/',
         }
 
@@ -530,11 +532,10 @@ class LoginViewTestCase(TestCase):
 
     def test_verify(self):
         device = self.alice.staticdevice_set.get()
-        token = device.token_set.get()
 
         params = {
             'otp_device': device.persistent_id,
-            'otp_token': token.token,
+            'otp_token': self.alice.get_username(),
             'next': '/',
         }
 
@@ -661,9 +662,10 @@ class AddStaticTokenTestCase(TestCase):
         token = out.getvalue().strip()
 
         static_token = StaticToken.objects.select_related('device__user').get(
-            token=token
+            digest=hash_token(token)
         )
         self.assertEqual(static_token.device.user, self.alice)
+        self.assertEqual(static_token.token, '')
 
     def test_existing_device(self):
         device = self.alice.staticdevice_set.create()
@@ -673,9 +675,10 @@ class AddStaticTokenTestCase(TestCase):
         token = out.getvalue().strip()
 
         static_token = StaticToken.objects.select_related('device__user').get(
-            token=token
+            digest=hash_token(token)
         )
         self.assertEqual(static_token.device, device)
+        self.assertEqual(static_token.token, '')
 
     def test_explicit_token(self):
         device = self.alice.staticdevice_set.create()
@@ -685,7 +688,8 @@ class AddStaticTokenTestCase(TestCase):
         token = out.getvalue().strip()
 
         static_token = StaticToken.objects.select_related('device__user').get(
-            token=token
+            digest=hash_token(token)
         )
         self.assertEqual(token, 'secret-token')
         self.assertEqual(static_token.device, device)
+        self.assertEqual(static_token.token, '')

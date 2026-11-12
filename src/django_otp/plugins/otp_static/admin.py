@@ -11,6 +11,10 @@ from .models import StaticDevice, StaticToken
 class StaticTokenInline(admin.TabularInline):
     model = StaticToken
     extra = 0
+    # New rows persist only a digest; keep the digest column out of the form
+    # so neither codes nor their hashes are displayed here. A value entered
+    # in ``token`` is hashed automatically on save.
+    fields = ['token']
 
 
 class StaticDeviceAdmin(admin.ModelAdmin):
