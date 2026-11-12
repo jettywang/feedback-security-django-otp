@@ -34,7 +34,9 @@ class EmailDevice(TimestampMixin, CooldownMixin, ThrottlingMixin, SideChannelDev
     registered email address (``user.email``).
 
     The tokens are valid for :setting:`OTP_EMAIL_TOKEN_VALIDITY` seconds. Once
-    a token has been accepted, it is no longer valid.
+    a token has been accepted, it is no longer valid. Each token is bound to
+    the email address it was delivered to: changing :attr:`email` or the
+    user's email address invalidates any outstanding token.
 
     Note that if you allow users to reset their passwords by email, this may
     provide little additional account security. It may still be useful for,
@@ -44,6 +46,10 @@ class EmailDevice(TimestampMixin, CooldownMixin, ThrottlingMixin, SideChannelDev
 
         *EmailField*: An alternative email address to send the tokens to.
 
+    .. attribute:: delivered_to
+
+        *EmailField*: The email address the current token was delivered to.
+
     """
 
     email = models.EmailField(
@@ -52,6 +58,26 @@ class EmailDevice(TimestampMixin, CooldownMixin, ThrottlingMixin, SideChannelDev
         null=True,
         help_text='Optional alternative email address to send tokens to',
     )
+
+    delivered_to = models.EmailField(
+        max_length=254,
+        blank=True,
+        null=True,
+        help_text='The email address the current token was delivered to',
+    )
+
+    def get_delivery_email(self):
+        """
+        Returns the email address tokens are currently delivered to.
+        """
+        return self.email or self.user.email
+
+    def generate_token(self, length=6, valid_secs=300, commit=True):
+        """
+        Generates a token bound to the current delivery email address.
+        """
+        self.delivered_to = self.get_delivery_email()
+        super().generate_token(length=length, valid_secs=valid_secs, commit=commit)
 
     def generate_challenge(self, extra_context=None):
         """
@@ -130,7 +156,7 @@ class EmailDevice(TimestampMixin, CooldownMixin, ThrottlingMixin, SideChannelDev
             self.get_subject(),
             body,
             settings.OTP_EMAIL_SENDER,
-            [self.email or self.user.email],
+            [self.get_delivery_email()],
             **kwargs,
         )
 
@@ -138,7 +164,10 @@ class EmailDevice(TimestampMixin, CooldownMixin, ThrottlingMixin, SideChannelDev
         """"""
         verify_allowed, _ = self.verify_is_allowed()
         if verify_allowed:
-            verified = super().verify_token(token)
+            if self.delivered_to == self.get_delivery_email():
+                verified = super().verify_token(token)
+            else:
+                verified = False
 
             if verified:
                 self.throttle_reset(commit=False)

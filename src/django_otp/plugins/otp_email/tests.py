@@ -5,6 +5,7 @@ from freezegun import freeze_time
 from django.core import mail
 from django.db import IntegrityError
 from django.test.utils import override_settings
+from django.utils import timezone
 
 from django_otp.forms import OTPAuthenticationForm
 from django_otp.test_utils import (
@@ -247,6 +248,75 @@ class EmailTest(EmailDeviceMixin, TestCase):
 
         self.assertEqual(len(mail.outbox), 1)
         self.assertEqual(mail.outbox[0].to, ['alice2@example.com'])
+
+
+@override_settings(
+    OTP_EMAIL_THROTTLE_FACTOR=0,
+    OTP_EMAIL_COOLDOWN_DURATION=10,
+    OTP_EMAIL_TOKEN_VALIDITY=300,
+)
+class DeliveryBindingTestCase(EmailDeviceMixin, TestCase):
+    def test_token_bound_to_delivery_address(self):
+        with freeze_time() as frozen_time:
+            # Generate: the token is delivered to the user's email address.
+            self.device.generate_challenge()
+            self.device.refresh_from_db()
+
+            self.assertEqual(len(mail.outbox), 1)
+            self.assertEqual(mail.outbox[0].to, ['alice@example.com'])
+            old_token = self.device.token
+            first_valid_until = self.device.valid_until
+            self.assertEqual(self.device.delivered_to, 'alice@example.com')
+            self.assertEqual(
+                first_valid_until, timezone.now() + timedelta(seconds=300)
+            )
+            self.assertEqual(self.device.throttling_failure_count, 0)
+
+            # Change the delivery address: the old token no longer verifies
+            # and the failed attempt is counted. The expiry record and the
+            # stored token are untouched.
+            self.device.email = 'alice2@example.com'
+            self.device.save()
+
+            self.assertFalse(self.device.verify_token(old_token))
+            self.device.refresh_from_db()
+            self.assertEqual(self.device.throttling_failure_count, 1)
+            self.assertEqual(self.device.token, old_token)
+            self.assertEqual(self.device.valid_until, first_valid_until)
+
+            # Regenerate after the cooldown: a new token goes to the new
+            # address and the expiry is pushed out. Generation does not
+            # affect the failure count.
+            frozen_time.tick(delta=timedelta(seconds=11))
+            self.device.generate_challenge()
+            self.device.refresh_from_db()
+
+            self.assertEqual(len(mail.outbox), 2)
+            self.assertEqual(mail.outbox[1].to, ['alice2@example.com'])
+            self.assertEqual(self.device.delivered_to, 'alice2@example.com')
+            self.assertEqual(
+                self.device.valid_until,
+                timezone.now() + timedelta(seconds=300),
+            )
+            self.assertGreater(self.device.valid_until, first_valid_until)
+            self.assertEqual(self.device.throttling_failure_count, 1)
+
+            # The new token verifies and resets the failure count.
+            self.assertTrue(self.device.verify_token(self.device.token))
+            self.device.refresh_from_db()
+            self.assertIsNone(self.device.token)
+            self.assertEqual(self.device.throttling_failure_count, 0)
+
+    def test_user_email_change_invalidates_token(self):
+        self.device.generate_challenge()
+        token = self.device.token
+
+        alice = self.device.user
+        alice.email = 'alice2@example.com'
+        alice.save()
+
+        device = EmailDevice.objects.get(pk=self.device.pk)
+        self.assertFalse(device.verify_token(token))
 
 
 @override_settings(
