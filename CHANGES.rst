@@ -1,3 +1,15 @@
+v1.7.6 - Unreleased - Unified verification failure classification
+--------------------------------------------------------------------------------
+
+- Verification failures are now classified the same way whether they come
+  from the authentication forms or from ``django_otp.verify_token``: both go
+  through the new ``django_otp.verify_device`` boundary, and the
+  ``otp_verification_failed`` signal (still importable from
+  ``django_otp.forms``) now carries a public ``reason`` from
+  ``django_otp.VerificationFailure``. The submitted token is never included
+  in the signal.
+
+
 v1.7.5 - October 16, 2026 - Revoke sessions for unconfirmed devices
 --------------------------------------------------------------------------------
 

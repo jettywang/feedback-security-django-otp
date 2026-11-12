@@ -2,14 +2,23 @@ from django import forms
 from django.contrib.auth.forms import AuthenticationForm
 from django.db import transaction
 from django.db.models.fields import BLANK_CHOICE_DASH
-from django.dispatch import Signal
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext_lazy
 
-from . import devices_for_user
+from . import (
+    VerificationFailure,
+    devices_for_user,
+    otp_verification_failed,
+    verify_device,
+)
 from .models import Device, VerifyNotAllowed
 
-otp_verification_failed = Signal()
+__all__ = [
+    'OTPAuthenticationFormMixin',
+    'OTPAuthenticationForm',
+    'OTPTokenForm',
+    'otp_verification_failed',
+]
 
 
 class OTPAuthenticationFormMixin:
@@ -158,25 +167,24 @@ class OTPAuthenticationFormMixin:
                 )
 
     def _verify_token(self, user, token, device=None):
-        if device is None:
-            # SECURITY: Trying every one of the user's devices in turn (as
-            # this used to do, via match_token()) records a failed
-            # verification attempt against each device that doesn't match,
-            # even though the overall login succeeds. That can throttle
-            # unrelated devices (e.g. recovery codes) that were never
-            # actually used. Require an explicit choice instead.
+        # SECURITY: Trying every one of the user's devices in turn (as
+        # this used to do, via match_token()) records a failed
+        # verification attempt against each device that doesn't match,
+        # even though the overall login succeeds. That can throttle
+        # unrelated devices (e.g. recovery codes) that were never
+        # actually used. Require an explicit choice instead.
+        result = verify_device(user, device, token, sender=self.__class__)
+
+        if result.reason is VerificationFailure.NO_DEVICE:
             raise forms.ValidationError(
                 self.otp_error_messages['device_required'],
                 code='device_required',
             )
 
-        verify_is_allowed, extra = device.verify_is_allowed()
-        if not verify_is_allowed:
+        if result.reason is VerificationFailure.NOT_ALLOWED:
             # Try to match specific conditions we know about.
-            if (
-                'reason' in extra
-                and extra['reason'] == VerifyNotAllowed.N_FAILED_ATTEMPTS
-            ):
+            extra = result.extra or {}
+            if extra.get('reason') == VerifyNotAllowed.N_FAILED_ATTEMPTS:
                 raise forms.ValidationError(
                     self.otp_error_messages['n_failed_attempts'] % extra
                 )
@@ -187,18 +195,12 @@ class OTPAuthenticationFormMixin:
                 self.otp_error_messages['verification_not_allowed']
             )
 
-        device = device if device.verify_token(token) else None
-
-        if device is None:
-            otp_verification_failed.send(
-                sender=self.__class__,
-                user=user,
-            )
+        if result.reason is VerificationFailure.INVALID_TOKEN:
             raise forms.ValidationError(
                 self.otp_error_messages['invalid_token'], code='invalid_token'
             )
 
-        return device
+        return result.device
 
     def _update_form(self, user):
         if 'otp_device' in self.fields:

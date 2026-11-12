@@ -14,11 +14,13 @@ from django.urls import reverse
 
 from django_otp import (
     DEVICE_ID_SESSION_KEY,
+    VerificationFailure,
     device_classes,
     match_token,
     oath,
     user_has_device,
     util,
+    verify_device,
     verify_token,
 )
 from django_otp.forms import (
@@ -27,6 +29,7 @@ from django_otp.forms import (
     otp_verification_failed,
 )
 from django_otp.middleware import OTPMiddleware
+from django_otp.models import VerifyNotAllowed
 from django_otp.plugins.otp_static.models import StaticDevice, StaticToken
 
 from .test_utils import TestCase, TransactionTestCase
@@ -121,6 +124,188 @@ class OTPVerificationFailedSignalTestCase(TestCase):
         self.assertTrue(
             self.signal_received, "otp_verification_failed signal was not emitted."
         )
+
+
+class FakeDevice:
+    """
+    A minimal duck-typed device, standing in for custom device
+    implementations that plug into the shared verification boundary through
+    verify_is_allowed()/verify_token().
+    """
+
+    def __init__(self, user_id, allowed=True, token='fake-valid'):
+        self.user_id = user_id
+        self.allowed = allowed
+        self.token = token
+        self.verify_calls = []
+
+    def verify_is_allowed(self):
+        if self.allowed:
+            return (True, None)
+        return (
+            False,
+            {'reason': VerifyNotAllowed.N_FAILED_ATTEMPTS, 'failure_count': 3},
+        )
+
+    def verify_token(self, token):
+        self.verify_calls.append(token)
+        return token == self.token
+
+
+@override_settings(OTP_STATIC_THROTTLE_FACTOR=1)
+class VerificationBoundaryTestCase(TestCase):
+    """
+    The forms, the verify_token() API, and custom devices all verify through
+    django_otp.verify_device(), so a signal subscriber sees the same public
+    failure classification - and never the token - regardless of entry point.
+    """
+
+    def setUp(self):
+        try:
+            self.alice = self.create_user('alice', 'password')
+        except IntegrityError:
+            self.skipTest("Unable to create a test user.")
+        else:
+            self.device = self.alice.staticdevice_set.create()
+            self.device.token_set.create(token='valid-token')
+
+        self.events = []
+        otp_verification_failed.connect(self._receiver)
+
+    def tearDown(self):
+        otp_verification_failed.disconnect(self._receiver)
+
+    def _receiver(self, sender, **kwargs):
+        self.events.append(kwargs)
+
+    def assert_events(self, *reasons, token):
+        self.assertEqual([event['reason'] for event in self.events], list(reasons))
+        for event in self.events:
+            self.assertNotIn('token', event)
+            self.assertNotIn(token, map(str, event.values()))
+
+    def throttle_device(self):
+        self.device.verify_token('bogus-token')
+        self.device.refresh_from_db()
+
+    #
+    # Form entry point.
+    #
+
+    def token_form(self, data):
+        form = OTPTokenForm(self.alice, None, data)
+        form.is_valid()
+        return form
+
+    def test_form_no_device(self):
+        form = self.token_form({'otp_device': '', 'otp_token': 'bogus-token'})
+
+        self.assertEqual(form.errors['__all__'].as_data()[0].code, 'device_required')
+        self.assert_events(VerificationFailure.NO_DEVICE, token='bogus-token')
+
+    def test_form_throttled(self):
+        self.throttle_device()
+        form = self.token_form(
+            {'otp_device': self.device.persistent_id, 'otp_token': 'bogus-token'}
+        )
+
+        self.assertIn(
+            'temporarily disabled', form.errors['__all__'].as_data()[0].message
+        )
+        self.assert_events(VerificationFailure.NOT_ALLOWED, token='bogus-token')
+
+    def test_form_invalid_token(self):
+        form = self.token_form(
+            {'otp_device': self.device.persistent_id, 'otp_token': 'bogus-token'}
+        )
+
+        self.assertEqual(form.errors['__all__'].as_data()[0].code, 'invalid_token')
+        self.assert_events(VerificationFailure.INVALID_TOKEN, token='bogus-token')
+
+    def test_form_success(self):
+        form = self.token_form(
+            {'otp_device': self.device.persistent_id, 'otp_token': 'valid-token'}
+        )
+
+        self.assertTrue(form.is_valid())
+        self.assert_events(token='valid-token')
+
+    #
+    # Direct API entry point.
+    #
+
+    def test_api_no_device(self):
+        verified = verify_token(
+            self.alice, 'otp_static.staticdevice/9999', 'bogus-token'
+        )
+
+        self.assertIsNone(verified)
+        self.assert_events(VerificationFailure.NO_DEVICE, token='bogus-token')
+
+    def test_api_throttled(self):
+        self.throttle_device()
+        verified = verify_token(self.alice, self.device.persistent_id, 'bogus-token')
+
+        self.assertIsNone(verified)
+        self.assert_events(VerificationFailure.NOT_ALLOWED, token='bogus-token')
+
+    def test_api_invalid_token(self):
+        verified = verify_token(self.alice, self.device.persistent_id, 'bogus-token')
+
+        self.assertIsNone(verified)
+        self.assert_events(VerificationFailure.INVALID_TOKEN, token='bogus-token')
+
+    def test_api_success(self):
+        verified = verify_token(self.alice, self.device.persistent_id, 'valid-token')
+
+        self.assertEqual(verified, self.device)
+        self.assert_events(token='valid-token')
+
+    #
+    # Custom (fake) device through the shared boundary.
+    #
+
+    def test_fake_device_no_device(self):
+        result = verify_device(self.alice, None, 'bogus-token')
+
+        self.assertEqual(result.reason, VerificationFailure.NO_DEVICE)
+        self.assert_events(VerificationFailure.NO_DEVICE, token='bogus-token')
+
+    def test_fake_device_other_user_is_no_device(self):
+        other = self.create_user('other', 'password')
+        device = FakeDevice(other.pk)
+        result = verify_device(self.alice, device, 'fake-valid')
+
+        self.assertEqual(result.reason, VerificationFailure.NO_DEVICE)
+        self.assertEqual(device.verify_calls, [])
+        self.assert_events(VerificationFailure.NO_DEVICE, token='fake-valid')
+
+    def test_fake_device_throttled(self):
+        device = FakeDevice(self.alice.pk, allowed=False)
+        result = verify_device(self.alice, device, 'bogus-token')
+
+        self.assertEqual(result.reason, VerificationFailure.NOT_ALLOWED)
+        self.assertEqual(
+            result.extra,
+            {'reason': VerifyNotAllowed.N_FAILED_ATTEMPTS, 'failure_count': 3},
+        )
+        self.assertEqual(device.verify_calls, [])
+        self.assert_events(VerificationFailure.NOT_ALLOWED, token='bogus-token')
+
+    def test_fake_device_invalid_token(self):
+        device = FakeDevice(self.alice.pk)
+        result = verify_device(self.alice, device, 'bogus-token')
+
+        self.assertEqual(result.reason, VerificationFailure.INVALID_TOKEN)
+        self.assert_events(VerificationFailure.INVALID_TOKEN, token='bogus-token')
+
+    def test_fake_device_success(self):
+        device = FakeDevice(self.alice.pk)
+        result = verify_device(self.alice, device, 'fake-valid')
+
+        self.assertIsNone(result.reason)
+        self.assertIs(result.device, device)
+        self.assert_events(token='fake-valid')
 
 
 class OTPAuthenticationFormDeviceRequiredTestCase(TestCase):

@@ -51,7 +51,7 @@ This form includes additional fields and behavior to solicit an OTP token from
 the user and verify it against their registered devices. This form's validation
 only succeeds if it is able to both authenticate the user with the username and
 password and also verify them with an OTP token. If the verification fails, the
-:data:`~django_otp.forms.otp_verification_failed` signal is emitted. The form
+:data:`~django_otp.otp_verification_failed` signal is emitted. The form
 can be used with :class:`django.contrib.auth.views.LoginView` simply by passing
 it in the ``authentication_form`` keyword parameter::
 
@@ -121,20 +121,28 @@ token to verify, you can use :class:`django_otp.forms.OTPTokenForm`.
 Signals
 ~~~~~~~
 
-.. data:: django_otp.forms.otp_verification_failed
+.. data:: django_otp.otp_verification_failed
 
-    This signal is sent when an OTP verification attempt fails. The source of
-    the signal is :class:`~django_otp.forms.OTPAuthenticationFormMixin`,
-    therefore it will generally be emitted only if using the provided
-    :class:`~django_otp.forms.OTPAuthenticationForm` or
-    :class:`~django_otp.forms.OTPTokenForm`. The signal provides the following
-    arguments:
+    This signal is sent when an OTP verification attempt fails, whether the
+    attempt was made through :class:`~django_otp.forms.OTPAuthenticationForm`,
+    :class:`~django_otp.forms.OTPTokenForm`, or a direct call to
+    :func:`django_otp.verify_token`. All of these go through
+    :func:`django_otp.verify_device`, so subscribers see the same failure
+    classification regardless of the entry point. For backwards
+    compatibility, the signal can also be imported from ``django_otp.forms``.
+    The signal provides the following arguments:
 
     ``sender``
-        The class of the form that attempted the verification.
+        The class of the form that attempted the verification, or ``None``
+        for direct calls to :func:`django_otp.verify_token`.
 
     ``user``
         The user that attempted the verification.
+
+    ``reason``
+        A :class:`django_otp.VerificationFailure` member classifying the
+        failure. This is safe to expose to alerting and logging; the
+        submitted token is never included in the signal arguments.
 
 
 Custom Forms
@@ -167,6 +175,12 @@ process directly.
 .. autofunction:: django_otp.user_has_device
 
 .. autofunction:: django_otp.verify_token
+
+.. autofunction:: django_otp.verify_device
+
+.. autoclass:: django_otp.VerificationFailure
+
+.. autoclass:: django_otp.VerificationResult
 
 .. autofunction:: django_otp.match_token
 

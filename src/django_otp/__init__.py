@@ -1,7 +1,112 @@
+import enum
+from typing import NamedTuple
+
 from django.contrib.auth.signals import user_logged_in
 from django.db import transaction
+from django.dispatch import Signal
 
 DEVICE_ID_SESSION_KEY = 'otp_device_id'
+
+#: Emitted when an OTP verification attempt fails, whether it was made
+#: through one of the authentication forms or through :func:`verify_token`.
+#: Receivers are called with the ``sender``, the ``user`` that attempted the
+#: verification and a public ``reason`` from :class:`VerificationFailure`.
+#: The submitted token is deliberately never included in the event.
+otp_verification_failed = Signal()
+
+
+class VerificationFailure(enum.Enum):
+    """
+    Public classification of OTP verification failures.
+
+    These values are safe to expose to alerting and logging: they describe
+    the category of a failure without revealing anything about the submitted
+    token or the internals of a device.
+
+    .. data:: NO_DEVICE
+
+       No device was selected, the selected device does not exist, or it does
+       not belong to the user. These are deliberately indistinguishable so as
+       not to reveal which devices exist.
+
+    .. data:: NOT_ALLOWED
+
+       The device refused verification, e.g. because it is throttled. See
+       :meth:`~django_otp.models.Device.verify_is_allowed`.
+
+    .. data:: INVALID_TOKEN
+
+       The device accepted the attempt, but the token did not match.
+
+    """
+
+    NO_DEVICE = 'no_device'
+    NOT_ALLOWED = 'not_allowed'
+    INVALID_TOKEN = 'invalid_token'
+
+
+class VerificationResult(NamedTuple):
+    """
+    The outcome of :func:`verify_device`.
+
+    On success, ``device`` is the verified device and ``reason`` is ``None``.
+    On failure, ``device`` is ``None`` and ``reason`` is a
+    :class:`VerificationFailure` member. ``extra`` carries the data dict
+    returned by :meth:`~django_otp.models.Device.verify_is_allowed` when
+    verification was not allowed, for local error reporting; it is not part
+    of the public classification and is never sent with the signal.
+    """
+
+    device: object
+    reason: object
+    extra: object
+
+
+def verify_device(user, device, token, sender=None):
+    """
+    Verifies a :term:`token` against a specific device on behalf of a user.
+
+    This is the shared verification boundary used by both the authentication
+    forms and :func:`verify_token`, so that all entry points classify
+    failures the same way. Custom devices plug in through the usual
+    :meth:`~django_otp.models.Device.verify_is_allowed` and
+    :meth:`~django_otp.models.Device.verify_token` methods.
+
+    On failure, :data:`otp_verification_failed` is emitted with a public
+    :class:`VerificationFailure` ``reason``; the token is never included in
+    the event.
+
+    :param user: The user supplying the token.
+    :type user: :class:`~django.contrib.auth.models.User`
+
+    :param device: The device to verify against, or ``None``.
+    :type device: :class:`~django_otp.models.Device` or ``None``
+
+    :param str token: An OTP token to verify.
+
+    :param sender: The ``sender`` to report when emitting
+        :data:`otp_verification_failed`.
+
+    :rtype: :class:`VerificationResult`
+
+    """
+    if (device is None) or (device.user_id != user.pk):
+        # SECURITY: A device that doesn't exist and one that belongs to
+        # another user must be indistinguishable here.
+        result = VerificationResult(None, VerificationFailure.NO_DEVICE, None)
+    else:
+        verify_is_allowed, extra = device.verify_is_allowed()
+        if not verify_is_allowed:
+            result = VerificationResult(None, VerificationFailure.NOT_ALLOWED, extra)
+        elif device.verify_token(token):
+            result = VerificationResult(device, None, None)
+        else:
+            result = VerificationResult(None, VerificationFailure.INVALID_TOKEN, None)
+
+    if result.reason is not None:
+        otp_verification_failed.send(sender, user=user, reason=result.reason)
+
+    return result
 
 
 def login(request, device):
@@ -47,6 +152,10 @@ def verify_token(user, device_id, token):
     This wraps the verification process in a transaction to ensure that things
     like throttling polices are properly enforced.
 
+    Verification goes through :func:`verify_device`, so failures are
+    classified and reported via :data:`otp_verification_failed` exactly as
+    they are by the authentication forms.
+
     :param user: The user supplying the token.
     :type user: :class:`~django.contrib.auth.models.User`
 
@@ -60,17 +169,11 @@ def verify_token(user, device_id, token):
     """
     from django_otp.models import Device
 
-    verified = None
     with transaction.atomic():
         device = Device.from_persistent_id(device_id, for_verify=True)
-        if (
-            (device is not None)
-            and (device.user_id == user.pk)
-            and device.verify_token(token)
-        ):
-            verified = device
+        result = verify_device(user, device, token)
 
-    return verified
+    return result.device
 
 
 def match_token(user, token):
