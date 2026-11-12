@@ -1,3 +1,15 @@
+v1.8.0 - Unreleased
+--------------------------------------------------------------------------------
+
+- TOTP secrets and QR codes now require a dedicated
+  ``otp_totp.view_totpdevice_config`` permission. Ordinary device metadata
+  remains visible with the usual view or change permission, and
+  ``OTP_ADMIN_HIDE_SENSITIVE_DATA`` still takes precedence.
+- Every TOTP configuration or QR code display, whether granted or denied,
+  emits an ``otp_admin_config_accessed`` event and logs to the
+  ``django_otp.audit`` logger. The audit payload contains only the event name
+  and the device primary key.
+
 v1.7.5 - October 16, 2026 - Revoke sessions for unconfirmed devices
 --------------------------------------------------------------------------------
 

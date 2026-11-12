@@ -1,10 +1,51 @@
+import logging
+
 from django import forms
 from django.contrib.admin.forms import AdminAuthenticationForm
 from django.contrib.admin.sites import AdminSite
 from django.contrib.auth import get_user_model
 from django.core.exceptions import FieldDoesNotExist
+from django.dispatch import Signal
 
 from .forms import OTPAuthenticationFormMixin
+
+
+#: Sent whenever an administrator requests a view that can expose sensitive
+#: device configuration. Receivers get exactly two keyword arguments:
+#: ``event`` and ``device_id``.
+otp_admin_config_accessed = Signal()
+
+#: Audit event values. The outcome is part of the event so a receiver can
+#: tell a successful display from a denied request using only the event and
+#: the device primary key.
+CONFIG_VIEW_GRANTED = 'totp_config_view_granted'
+CONFIG_VIEW_DENIED = 'totp_config_view_denied'
+
+audit_logger = logging.getLogger('django_otp.audit')
+
+
+def audit_config_access(sender, event, device_id):
+    """
+    Record a single sensitive-configuration access event.
+
+    The audit payload is deliberately limited to the event name and the device
+    primary key. Secrets, QR payloads and user identity are never included.
+    """
+    otp_admin_config_accessed.send(
+        sender=sender,
+        event=event,
+        device_id=device_id,
+    )
+    audit_logger.info(event, extra={'event': event, 'device_id': device_id})
+
+
+def user_has_config_permission(user, model):
+    """
+    Return whether ``user`` holds the dedicated configuration permission for
+    ``model`` (e.g. ``otp_totp.view_totpdevice_config``).
+    """
+    opts = model._meta.concrete_model._meta
+    return user.has_perm(f'{opts.app_label}.view_{opts.model_name}_config')
 
 
 def _admin_template_for_django_version():

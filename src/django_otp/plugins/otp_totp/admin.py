@@ -7,7 +7,13 @@ from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from django.utils.html import format_html
 
-from django_otp.admin import user_model_search_fields
+from django_otp.admin import (
+    CONFIG_VIEW_DENIED,
+    CONFIG_VIEW_GRANTED,
+    audit_config_access,
+    user_has_config_permission,
+    user_model_search_fields,
+)
 from django_otp.conf import settings
 from django_otp.qr import write_qrcode_image
 
@@ -18,6 +24,11 @@ class TOTPDeviceAdmin(admin.ModelAdmin):
     """
     :class:`~django.contrib.admin.ModelAdmin` for
     :class:`~django_otp.plugins.otp_totp.models.TOTPDevice`.
+
+    Viewing a device's secret key or its QR code requires the dedicated
+    ``otp_totp.view_totpdevice_config`` permission, in addition to the normal
+    view or change permission for the model. Ordinary device metadata remains
+    available with just the normal model permissions.
     """
 
     User = get_user_model()
@@ -31,19 +42,47 @@ class TOTPDeviceAdmin(admin.ModelAdmin):
     readonly_fields = ['created_at', 'last_used_at', 'qrcode_link']
     radio_fields = {'digits': admin.HORIZONTAL}
 
+    def user_can_view_config(self, request):
+        return user_has_config_permission(request.user, TOTPDevice)
+
+    def _show_key(self, request, obj):
+        return obj is None or (
+            not settings.OTP_ADMIN_HIDE_SENSITIVE_DATA
+            and self.user_can_view_config(request)
+        )
+
+    def render_change_form(
+        self, request, context, add=False, change=False, form_url='', obj=None
+    ):
+        if (
+            request.method == 'GET'
+            and not add
+            and obj is not None
+            and self._show_key(request, obj)
+        ):
+            audit_config_access(self, CONFIG_VIEW_GRANTED, obj.pk)
+
+        return super().render_change_form(
+            request, context, add=add, change=change, form_url=form_url, obj=obj
+        )
+
     def get_list_display(self, request):
         list_display = super().get_list_display(request)
-        if not settings.OTP_ADMIN_HIDE_SENSITIVE_DATA:
+        if (
+            not settings.OTP_ADMIN_HIDE_SENSITIVE_DATA
+            and self.user_can_view_config(request)
+        ):
             list_display = [*list_display, 'qrcode_link']
         return list_display
 
     def get_fieldsets(self, request, obj=None):
         # Show the key value only for adding new objects or when sensitive data
-        # is not hidden.
-        if settings.OTP_ADMIN_HIDE_SENSITIVE_DATA and obj:
-            configuration_fields = ['step', 't0', 'digits', 'tolerance']
-        else:
+        # is not hidden and the user has the dedicated configuration
+        # permission.
+        if self._show_key(request, obj):
             configuration_fields = ['key', 'step', 't0', 'digits', 'tolerance']
+        else:
+            configuration_fields = ['step', 't0', 'digits', 'tolerance']
         fieldsets = [
             (
                 'Identity',
@@ -80,8 +119,13 @@ class TOTPDeviceAdmin(admin.ModelAdmin):
             ),
         ]
         # Show the QR code link only for existing objects when sensitive data
-        # is not hidden.
-        if not settings.OTP_ADMIN_HIDE_SENSITIVE_DATA and obj:
+        # is not hidden and the user has the dedicated configuration
+        # permission.
+        if (
+            obj
+            and not settings.OTP_ADMIN_HIDE_SENSITIVE_DATA
+            and self.user_can_view_config(request)
+        ):
             fieldsets.append(
                 (
                     None,
@@ -132,34 +176,47 @@ class TOTPDeviceAdmin(admin.ModelAdmin):
 
         return urls
 
-    def config_view(self, request, pk):
-        if settings.OTP_ADMIN_HIDE_SENSITIVE_DATA:
+    def _authorize_config_view(self, request, device):
+        """
+        Enforce the dedicated configuration permission and record a denial.
+
+        Raises :exc:`~django.core.exceptions.PermissionDenied` after recording
+        a denied event unless the user may see the secret key and QR code. A
+        granted event is recorded by the caller once the display actually
+        succeeds.
+        """
+        allowed = (
+            not settings.OTP_ADMIN_HIDE_SENSITIVE_DATA
+            and self.has_view_or_change_permission(request, device)
+            and self.user_can_view_config(request)
+        )
+        if not allowed:
+            audit_config_access(self, CONFIG_VIEW_DENIED, device.pk)
             raise PermissionDenied()
 
+    def config_view(self, request, pk):
         device = TOTPDevice.objects.get(pk=pk)
-        if not self.has_view_or_change_permission(request, device):
-            raise PermissionDenied()
+        self._authorize_config_view(request, device)
 
         context = dict(
             self.admin_site.each_context(request),
             device=device,
         )
+        audit_config_access(self, CONFIG_VIEW_GRANTED, device.pk)
 
         return TemplateResponse(request, 'otp_totp/admin/config.html', context)
 
     def qrcode_view(self, request, pk):
-        if settings.OTP_ADMIN_HIDE_SENSITIVE_DATA:
-            raise PermissionDenied()
-
         device = TOTPDevice.objects.get(pk=pk)
-        if not self.has_view_or_change_permission(request, device):
-            raise PermissionDenied()
+        self._authorize_config_view(request, device)
 
         try:
             response = HttpResponse(content_type='image/svg+xml')
             write_qrcode_image(device.config_url, response)
         except ModuleNotFoundError:
             response = HttpResponse('', status=503)
+        else:
+            audit_config_access(self, CONFIG_VIEW_GRANTED, device.pk)
 
         return response
 

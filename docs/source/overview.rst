@@ -305,6 +305,47 @@ method.
 
 .. autoclass:: django_otp.plugins.otp_totp.admin.TOTPDeviceAdmin
 
+.. _totp-device-config-permission:
+
+Viewing TOTP Secrets and QR Codes
+'''''''''''''''''''''''''''''''
+
+TOTP devices have two permission boundaries. Ordinary device metadata (owner,
+name, timestamps, settings and state) is available to staff with the usual
+``view_totpdevice`` or ``change_totpdevice`` permission. The secret ``key``, the
+QR code link and the ``config`` and ``qrcode`` views additionally require the
+dedicated ``otp_totp.view_totpdevice_config`` permission::
+
+    from django.contrib.auth.models import Permission
+
+    permission = Permission.objects.get(codename='view_totpdevice_config')
+    user.user_permissions.add(permission)
+
+:setting:`OTP_ADMIN_HIDE_SENSITIVE_DATA` still takes precedence: when it is
+``True``, no secret or QR code is exposed to anyone.
+
+Every request to the ``config`` or ``qrcode`` views, and every device detail
+page that actually renders the key, emits the
+``otp_admin_config_accessed`` signal and logs a record to
+the ``django_otp.audit`` logger. The event name
+(``totp_config_view_granted`` or ``totp_config_view_denied``) identifies a
+successful display or a denial, and the only other field is the device primary
+key. Secrets and user identity are never included. For example::
+
+    import logging
+
+    from django_otp.admin import otp_admin_config_accessed
+
+    logger = logging.getLogger('django_otp.audit')
+
+
+    def record_config_access(sender, event, device_id, **kwargs):
+        # event is one of the CONFIG_VIEW_GRANTED / CONFIG_VIEW_DENIED values
+        audit_store.write(event=event, device_id=device_id)
+
+
+    otp_admin_config_accessed.connect(record_config_access)
+
 .. _TOTP: http://tools.ietf.org/html/rfc6238#section-4
 
 TOTP Settings
@@ -556,7 +597,9 @@ Default: `False`
 
 This controls showing some sensitive data on the Django admin site (e.g., keys
 and corresponding QR codes, static tokens). Note, it is respected by built-in
-plugins, but external ones may or may not support it.
+plugins, but external ones may or may not support it. Viewing TOTP secrets
+and QR codes requires the ``otp_totp.view_totpdevice_config`` permission;
+see :ref:`totp-device-config-permission`.
 
 
 Glossary

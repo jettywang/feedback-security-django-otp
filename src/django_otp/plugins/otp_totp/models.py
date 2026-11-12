@@ -98,6 +98,12 @@ class TOTPDevice(TimestampMixin, ThrottlingMixin, Device):
 
     class Meta(Device.Meta):
         verbose_name = "TOTP device"
+        permissions = [
+            (
+                'view_totpdevice_config',
+                "Can view TOTP device configuration (secret key and QR code)",
+            ),
+        ]
 
     @property
     def bin_key(self):
