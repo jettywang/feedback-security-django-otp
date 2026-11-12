@@ -4,13 +4,23 @@ import pickle
 from threading import Thread
 import unittest
 
+from asgiref.sync import async_to_sync
+
+from django.apps import apps
 from django.contrib.auth.models import AnonymousUser
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import IntegrityError, connection
-from django.test import AsyncRequestFactory, RequestFactory, skipUnlessDBFeature
-from django.test.utils import override_settings
-from django.urls import reverse
+from django.http import HttpResponse
+from django.template import engines
+from django.test import (
+    AsyncRequestFactory,
+    Client,
+    RequestFactory,
+    skipUnlessDBFeature,
+)
+from django.test.utils import CaptureQueriesContext, override_settings
+from django.urls import path, reverse
 
 from django_otp import (
     DEVICE_ID_SESSION_KEY,
@@ -27,9 +37,23 @@ from django_otp.forms import (
     otp_verification_failed,
 )
 from django_otp.middleware import OTPMiddleware
+from django_otp.models import Device
 from django_otp.plugins.otp_static.models import StaticDevice, StaticToken
 
 from .test_utils import TestCase, TransactionTestCase
+
+
+def count_device_queries(queries_context):
+    device_tables = {
+        model._meta.db_table
+        for model in apps.get_models()
+        if issubclass(model, Device) and not model._meta.proxy
+    }
+    return sum(
+        1
+        for query in queries_context.captured_queries
+        if any(table in query["sql"] for table in device_tables)
+    )
 
 
 def load_tests(loader, tests, pattern):
@@ -338,6 +362,151 @@ class OTPMiddlewareTestCase(TestCase):
         # Should not raise an exception.
         pickle.dumps(request.user)
 
+    def _request(self, user, session):
+        request = self.factory.get('/')
+        request.user = user
+        request.session = session
+        return request
+
+    def test_repeated_is_verified_uses_single_device_query(self):
+        device = self.alice.staticdevice_set.get()
+        request = self._request(
+            self.alice, {DEVICE_ID_SESSION_KEY: device.persistent_id}
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            self.middleware(request)
+            for _ in range(5):
+                self.assertTrue(request.user.is_verified())
+
+        self.assertEqual(count_device_queries(queries), 1)
+
+    def test_unverified_request_makes_no_device_query(self):
+        request = self._request(self.alice, {})
+
+        with CaptureQueriesContext(connection) as queries:
+            self.middleware(request)
+            # A view and a template may each check the verification state.
+            self.assertFalse(request.user.is_verified())
+            self.assertFalse(request.user.is_verified())
+
+        self.assertEqual(count_device_queries(queries), 0)
+
+    def test_anonymous_request_makes_no_device_query(self):
+        request = self._request(AnonymousUser(), {})
+
+        with CaptureQueriesContext(connection) as queries:
+            self.middleware(request)
+            self.assertFalse(request.user.is_verified())
+
+        self.assertEqual(count_device_queries(queries), 0)
+
+    def test_unused_verification_state_makes_no_device_query(self):
+        device = self.alice.staticdevice_set.get()
+        request = self._request(
+            self.alice, {DEVICE_ID_SESSION_KEY: device.persistent_id}
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            self.middleware(request)
+
+        self.assertEqual(count_device_queries(queries), 0)
+
+    def test_new_request_rereads_removed_device(self):
+        device = self.alice.staticdevice_set.get()
+        session = {DEVICE_ID_SESSION_KEY: device.persistent_id}
+
+        first_request = self._request(self.alice, session)
+        self.middleware(first_request)
+        self.assertTrue(first_request.user.is_verified())
+
+        device.delete()
+
+        second_request = self._request(self.alice, session)
+        with CaptureQueriesContext(connection) as queries:
+            self.middleware(second_request)
+            self.assertFalse(second_request.user.is_verified())
+
+        self.assertEqual(count_device_queries(queries), 1)
+        self.assertNotIn(DEVICE_ID_SESSION_KEY, session)
+
+    def test_new_request_does_not_reuse_other_accounts_state(self):
+        alice_device = self.alice.staticdevice_set.get()
+        bob_device = self.bob.staticdevice_set.get()
+
+        alice_request = self._request(
+            self.alice, {DEVICE_ID_SESSION_KEY: alice_device.persistent_id}
+        )
+        self.middleware(alice_request)
+        self.assertTrue(alice_request.user.is_verified())
+
+        # A later request for a different account must start from the current
+        # session state, not the previous request's cached verification.
+        bob_session = {DEVICE_ID_SESSION_KEY: bob_device.persistent_id}
+        bob_request = self._request(self.bob, bob_session)
+        with CaptureQueriesContext(connection) as queries:
+            self.middleware(bob_request)
+            self.assertTrue(bob_request.user.is_verified())
+
+        self.assertEqual(count_device_queries(queries), 1)
+
+        # A device bound to another account can never verify this request.
+        wrong_request = self._request(
+            self.alice, {DEVICE_ID_SESSION_KEY: bob_device.persistent_id}
+        )
+        self.middleware(wrong_request)
+        self.assertFalse(wrong_request.user.is_verified())
+
+
+def _is_verified_view(request):
+    # Simulates an order-detail page where the view and its template both
+    # consult the verification state within a single request.
+    request.user.is_verified()
+    template = engines["django"].from_string(
+        "{% if user.is_verified %}verified{% else %}not verified{% endif %}"
+    )
+    return HttpResponse(template.render({}, request))
+
+
+urlpatterns = [
+    path("", _is_verified_view),
+]
+
+
+@override_settings(ROOT_URLCONF=__name__)
+class OTPMiddlewareRequestQueryCountTestCase(TestCase):
+    def setUp(self):
+        try:
+            self.alice = self.create_user("alice", "password")
+        except IntegrityError:
+            self.skipTest("Unable to create a test user.")
+        else:
+            device = self.alice.staticdevice_set.create()
+            device.token_set.create(token="alice")
+
+    def test_unverified_request_makes_no_device_query(self):
+        client = Client()
+        client.force_login(self.alice)
+
+        with CaptureQueriesContext(connection) as queries:
+            response = client.get("/")
+
+        self.assertEqual(response.content, b"not verified")
+        self.assertEqual(count_device_queries(queries), 0)
+
+    def test_view_and_template_share_single_device_query(self):
+        client = Client()
+        client.force_login(self.alice)
+        session = client.session
+        session[DEVICE_ID_SESSION_KEY] = self.alice.staticdevice_set.get().persistent_id
+        session.save()
+
+        with CaptureQueriesContext(connection) as queries:
+            response = client.get("/")
+
+        self.assertEqual(response.content, b"verified")
+        self.assertEqual(count_device_queries(queries), 1)
+
 
 class OTPMiddlewareAsyncTestCase(TestCase):
     def setUp(self):
@@ -448,6 +617,92 @@ class OTPMiddlewareAsyncTestCase(TestCase):
         user = await request.auser()
         # Should not raise an exception.
         pickle.dumps(user)
+
+    def _async_device_queries(self, coroutine_function):
+        # CaptureQueriesContext.enter() opens the connection synchronously and
+        # thus cannot run inside the event loop; enter it here and drive the
+        # coroutine with async_to_sync, as Django's own async query tests do.
+        with CaptureQueriesContext(connection) as queries:
+            async_to_sync(coroutine_function)()
+        return count_device_queries(queries)
+
+    def test_repeated_is_verified_uses_single_device_query(self):
+        async def scenario():
+            request = await self._run_middleware(
+                self.alice, {DEVICE_ID_SESSION_KEY: self.alice_device_pid}
+            )
+            for _ in range(5):
+                user = await request.auser()
+                self.assertTrue(user.is_verified())
+
+        self.assertEqual(self._async_device_queries(scenario), 1)
+
+    def test_unverified_request_makes_no_device_query(self):
+        async def scenario():
+            request = await self._run_middleware(self.alice, {})
+            for _ in range(2):
+                user = await request.auser()
+                self.assertFalse(user.is_verified())
+
+        self.assertEqual(self._async_device_queries(scenario), 0)
+
+    def test_anonymous_request_makes_no_device_query(self):
+        async def scenario():
+            request = await self._run_middleware(AnonymousUser(), {})
+            user = await request.auser()
+            self.assertFalse(user.is_verified())
+
+        self.assertEqual(self._async_device_queries(scenario), 0)
+
+    def test_unused_verification_state_makes_no_device_query(self):
+        async def scenario():
+            await self._run_middleware(
+                self.alice, {DEVICE_ID_SESSION_KEY: self.alice_device_pid}
+            )
+
+        self.assertEqual(self._async_device_queries(scenario), 0)
+
+    def test_new_request_rereads_removed_device(self):
+        session = {DEVICE_ID_SESSION_KEY: self.alice_device_pid}
+
+        async def first_request():
+            request = await self._run_middleware(self.alice, session)
+            self.assertTrue((await request.auser()).is_verified())
+
+        async_to_sync(first_request)()
+        async_to_sync(StaticDevice.objects.all().adelete)()
+
+        async def second_request():
+            request = await self._run_middleware(self.alice, session)
+            self.assertFalse((await request.auser()).is_verified())
+            self.assertNotIn(DEVICE_ID_SESSION_KEY, session)
+
+        self.assertEqual(self._async_device_queries(second_request), 1)
+
+    def test_new_request_does_not_reuse_other_accounts_state(self):
+        async def alice_request():
+            request = await self._run_middleware(
+                self.alice, {DEVICE_ID_SESSION_KEY: self.alice_device_pid}
+            )
+            self.assertTrue((await request.auser()).is_verified())
+
+        async_to_sync(alice_request)()
+
+        async def bob_request():
+            request = await self._run_middleware(
+                self.bob, {DEVICE_ID_SESSION_KEY: self.bob_device_pid}
+            )
+            self.assertTrue((await request.auser()).is_verified())
+
+        self.assertEqual(self._async_device_queries(bob_request), 1)
+
+        async def wrong_request():
+            request = await self._run_middleware(
+                self.alice, {DEVICE_ID_SESSION_KEY: self.bob_device_pid}
+            )
+            self.assertFalse((await request.auser()).is_verified())
+
+        async_to_sync(wrong_request)()
 
 
 class LoginViewTestCase(TestCase):

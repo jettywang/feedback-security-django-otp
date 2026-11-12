@@ -1,3 +1,13 @@
+Unreleased
+--------------------------------------------------------------------------------
+
+- Memoize the async OTP verification state per request, so repeated
+  ``await request.auser()`` / ``is_verified()`` calls in one request perform a
+  single device lookup instead of one per call. As with the sync path,
+  requests that never inspect the verification state make no device query and
+  each new request re-reads the current device state.
+
+
 v1.7.5 - October 16, 2026 - Revoke sessions for unconfirmed devices
 --------------------------------------------------------------------------------
 

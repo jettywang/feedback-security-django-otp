@@ -25,10 +25,22 @@ class OTPMiddleware:
 
     This middleware is async capable. It wraps ``request.auser()`` similarly
     to ``request.user`` as described above.
+
+    The verified user is resolved lazily and at most once per request: the
+    sync path relies on a :class:`~django.utils.functional.SimpleLazyObject`
+    for ``request.user`` and the async path memoizes the result of
+    ``request.auser()`` on the request. Either way, repeated
+    ``is_verified()`` calls within a request share a single device lookup and
+    requests that never inspect the verification state make no device query.
+    Because the cache lives on the request object, a new request always
+    re-reads the current device state, so account switches and removed or
+    unconfirmed devices take effect immediately.
     """
 
     sync_capable = True
     async_capable = True
+
+    _acached_user_attr = "_otp_acached_user"
 
     def __init__(self, get_response):
         self.get_response = get_response
@@ -111,6 +123,9 @@ class OTPMiddleware:
         return Device.from_persistent_id(persistent_id)
 
     async def _verify_user_async_via_auser(self, request, auser):
+        if hasattr(request, self._acached_user_attr):
+            return getattr(request, self._acached_user_attr)
+
         user = await auser()
         self._init_user_fields(user)
 
@@ -123,6 +138,7 @@ class OTPMiddleware:
             )
             user.otp_device = self._finalize_device(request, user, device)
 
+        setattr(request, self._acached_user_attr, user)
         return user
 
     async def _adevice_from_persistent_id(self, persistent_id: str):

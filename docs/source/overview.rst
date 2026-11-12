@@ -164,6 +164,12 @@ verified without also being authenticated. [#agents]_
 
 The middleware is async capable. Using ``await request.auser()`` returns the
 user model augmented with the same properties as when using ``request.user``.
+The verification state is resolved lazily and memoized per request on both
+paths, so a request that never checks ``is_verified()`` makes no device query
+and repeated checks within the same request share a single device lookup. The
+memoization lives on the request object, so each new request re-reads the
+current device state: switching accounts or removing a device takes effect on
+the next request.
 
 
 Plugins and Devices
@@ -532,7 +538,9 @@ Asynchronous Support
 :class:`django_otp.middleware.OTPMiddleware` is async capable, ensuring there
 is no context switch caused by this middleware in ASGI servers. Both
 ``request.user`` and ``request.auser()`` return the user model augmented with
-additional properties.
+additional properties. On either path the device lookup happens at most once
+per request and only when the verification state is actually inspected; the
+per-request cache is never carried over to a subsequent request.
 
 
 Settings
