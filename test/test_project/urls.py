@@ -21,6 +21,8 @@ urlpatterns = [
     path('logout/', django.contrib.auth.views.LogoutView.as_view(), name='logout'),
     path('login-otp/', django_otp.views.LoginView.as_view(), name='login-otp'),
 
+    path('verification-status/', views.verification_status, name='verification-status'),
+
     path('require-login/', views.require_login, name='require-login'),
     path('require-otp/', views.require_otp, name='require-otp'),
     path('require-login-then-otp/', views.require_login_then_otp, name='require-login-then-otp'),

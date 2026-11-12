@@ -450,6 +450,258 @@ class OTPMiddlewareAsyncTestCase(TestCase):
         pickle.dumps(user)
 
 
+class OTPMiddlewareClientTestCase(TestCase):
+    """
+    Contract tests for :class:`~django_otp.middleware.OTPMiddleware` through
+    Django's real test clients.
+
+    These exercise the full request stack (session, auth, and OTP middleware)
+    to pin down what a user with a previously verified session sees once the
+    underlying device state changes. Every scenario runs against both the
+    sync and async test clients with identical inputs and identical
+    expectations, so the two stacks cannot drift apart.
+    """
+
+    def setUp(self):
+        try:
+            self.alice = self.create_user('alice', 'password')
+            self.bob = self.create_user('bob', 'password')
+        except IntegrityError:
+            self.skipTest("Unable to create a test user.")
+        else:
+            for user in [self.alice, self.bob]:
+                device = user.staticdevice_set.create()
+                # Static tokens are consumed on use, so each user gets a
+                # spare for scenarios that verify more than once.
+                device.token_set.create(token=user.get_username())
+                device.token_set.create(token=user.get_username() + '-again')
+
+        alice_device = self.alice.staticdevice_set.get()
+        self.alice_device_id = alice_device.persistent_id
+        self.alice_legacy_device_id = '{}.{}/{}'.format(
+            alice_device.__module__, alice_device.__class__.__name__, alice_device.id
+        )
+        self.bob_device_id = self.bob.staticdevice_set.get().persistent_id
+
+    #
+    # Sync client helpers
+    #
+
+    def _submit_otp(self, client, user, device_id, token=None):
+        response = client.post(
+            reverse('login-otp'),
+            {
+                'otp_device': device_id,
+                'otp_token': token or user.get_username(),
+                'next': '/',
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+
+    def _status(self, client):
+        response = client.get(reverse('verification-status'))
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def _set_session_device(self, client, device_id):
+        session = client.session
+        session[DEVICE_ID_SESSION_KEY] = device_id
+        session.save()
+
+    #
+    # Async client helpers
+    #
+
+    async def _asubmit_otp(self, client, user, device_id, token=None):
+        response = await client.post(
+            reverse('login-otp'),
+            {
+                'otp_device': device_id,
+                'otp_token': token or user.get_username(),
+                'next': '/',
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+
+    async def _astatus(self, client):
+        response = await client.get(reverse('verification-status'))
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    async def _aset_session_device(self, client, device_id):
+        session = await client.asession()
+        await session.aset(DEVICE_ID_SESSION_KEY, device_id)
+        await session.asave()
+
+    async def _asession_has_device(self, client):
+        session = await client.asession()
+        return await session.ahas_key(DEVICE_ID_SESSION_KEY)
+
+    #
+    # Sync contract tests
+    #
+
+    def test_verified_session(self):
+        self.client.login(username='alice', password='password')
+        self._submit_otp(self.client, self.alice, self.alice_device_id)
+
+        self.assertEqual(
+            self._status(self.client),
+            {'authenticated': True, 'username': 'alice', 'verified': True},
+        )
+
+    def test_verified_legacy_device_id(self):
+        self.client.login(username='alice', password='password')
+        self._set_session_device(self.client, self.alice_legacy_device_id)
+
+        self.assertEqual(
+            self._status(self.client),
+            {'authenticated': True, 'username': 'alice', 'verified': True},
+        )
+
+    def test_unconfirmed_device_revokes_session(self):
+        self.client.login(username='alice', password='password')
+        self._submit_otp(self.client, self.alice, self.alice_device_id)
+        self.assertTrue(self._status(self.client)['verified'])
+
+        self.alice.staticdevice_set.update(confirmed=False)
+
+        self.assertEqual(
+            self._status(self.client),
+            {'authenticated': True, 'username': 'alice', 'verified': False},
+        )
+        # The invalidated device reference is purged from the session...
+        self.assertNotIn(DEVICE_ID_SESSION_KEY, self.client.session)
+        # ...and subsequent requests don't resurrect it.
+        self.assertEqual(
+            self._status(self.client),
+            {'authenticated': True, 'username': 'alice', 'verified': False},
+        )
+        self.assertNotIn(DEVICE_ID_SESSION_KEY, self.client.session)
+
+    def test_device_belongs_to_another_user(self):
+        self.client.login(username='alice', password='password')
+        self._set_session_device(self.client, self.bob_device_id)
+
+        self.assertEqual(
+            self._status(self.client),
+            {'authenticated': True, 'username': 'alice', 'verified': False},
+        )
+        self.assertNotIn(DEVICE_ID_SESSION_KEY, self.client.session)
+        self.assertFalse(self._status(self.client)['verified'])
+
+    def test_account_switch_does_not_carry_verification(self):
+        self.client.login(username='alice', password='password')
+        self._submit_otp(self.client, self.alice, self.alice_device_id)
+        self.assertTrue(self._status(self.client)['verified'])
+
+        self.client.login(username='bob', password='password')
+        self.assertEqual(
+            self._status(self.client),
+            {'authenticated': True, 'username': 'bob', 'verified': False},
+        )
+
+        # Switching back does not resurrect the stale verification...
+        self.client.login(username='alice', password='password')
+        self.assertEqual(
+            self._status(self.client),
+            {'authenticated': True, 'username': 'alice', 'verified': False},
+        )
+        self.assertNotIn(DEVICE_ID_SESSION_KEY, self.client.session)
+
+        # ...but Alice can explicitly re-verify to recover.
+        self._submit_otp(
+            self.client, self.alice, self.alice_device_id, token='alice-again'
+        )
+        self.assertEqual(
+            self._status(self.client),
+            {'authenticated': True, 'username': 'alice', 'verified': True},
+        )
+
+    #
+    # Async contract tests (same scenarios, same expectations)
+    #
+
+    async def test_verified_session_async(self):
+        await self.async_client.alogin(username='alice', password='password')
+        await self._asubmit_otp(self.async_client, self.alice, self.alice_device_id)
+
+        self.assertEqual(
+            await self._astatus(self.async_client),
+            {'authenticated': True, 'username': 'alice', 'verified': True},
+        )
+
+    async def test_verified_legacy_device_id_async(self):
+        await self.async_client.alogin(username='alice', password='password')
+        await self._aset_session_device(
+            self.async_client, self.alice_legacy_device_id
+        )
+
+        self.assertEqual(
+            await self._astatus(self.async_client),
+            {'authenticated': True, 'username': 'alice', 'verified': True},
+        )
+
+    async def test_unconfirmed_device_revokes_session_async(self):
+        await self.async_client.alogin(username='alice', password='password')
+        await self._asubmit_otp(self.async_client, self.alice, self.alice_device_id)
+        self.assertTrue((await self._astatus(self.async_client))['verified'])
+
+        await self.alice.staticdevice_set.aupdate(confirmed=False)
+
+        self.assertEqual(
+            await self._astatus(self.async_client),
+            {'authenticated': True, 'username': 'alice', 'verified': False},
+        )
+        # The invalidated device reference is purged from the session...
+        self.assertFalse(await self._asession_has_device(self.async_client))
+        # ...and subsequent requests don't resurrect it.
+        self.assertEqual(
+            await self._astatus(self.async_client),
+            {'authenticated': True, 'username': 'alice', 'verified': False},
+        )
+        self.assertFalse(await self._asession_has_device(self.async_client))
+
+    async def test_device_belongs_to_another_user_async(self):
+        await self.async_client.alogin(username='alice', password='password')
+        await self._aset_session_device(self.async_client, self.bob_device_id)
+
+        self.assertEqual(
+            await self._astatus(self.async_client),
+            {'authenticated': True, 'username': 'alice', 'verified': False},
+        )
+        self.assertFalse(await self._asession_has_device(self.async_client))
+        self.assertFalse((await self._astatus(self.async_client))['verified'])
+
+    async def test_account_switch_does_not_carry_verification_async(self):
+        await self.async_client.alogin(username='alice', password='password')
+        await self._asubmit_otp(self.async_client, self.alice, self.alice_device_id)
+        self.assertTrue((await self._astatus(self.async_client))['verified'])
+
+        await self.async_client.alogin(username='bob', password='password')
+        self.assertEqual(
+            await self._astatus(self.async_client),
+            {'authenticated': True, 'username': 'bob', 'verified': False},
+        )
+
+        # Switching back does not resurrect the stale verification...
+        await self.async_client.alogin(username='alice', password='password')
+        self.assertEqual(
+            await self._astatus(self.async_client),
+            {'authenticated': True, 'username': 'alice', 'verified': False},
+        )
+        self.assertFalse(await self._asession_has_device(self.async_client))
+
+        # ...but Alice can explicitly re-verify to recover.
+        await self._asubmit_otp(
+            self.async_client, self.alice, self.alice_device_id, token='alice-again'
+        )
+        self.assertEqual(
+            await self._astatus(self.async_client),
+            {'authenticated': True, 'username': 'alice', 'verified': True},
+        )
+
+
 class LoginViewTestCase(TestCase):
     def setUp(self):
         try:

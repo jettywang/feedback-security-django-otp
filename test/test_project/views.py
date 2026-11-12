@@ -1,5 +1,5 @@
 from django.contrib.auth.decorators import login_required
-from django.http import HttpResponseRedirect
+from django.http import HttpResponseRedirect, JsonResponse
 from django.urls import reverse
 from django.views.generic.base import TemplateView
 
@@ -28,3 +28,19 @@ def require_otp(request):
 @otp_required
 def require_login_then_otp(request):
     return HttpResponseRedirect(reverse('home'))
+
+
+def verification_status(request):
+    """
+    Reports the authentication and OTP verification state that
+    OTPMiddleware installed on the request, so tests can observe it
+    through a real request/response cycle.
+    """
+    user = request.user
+    return JsonResponse(
+        {
+            'authenticated': user.is_authenticated,
+            'username': user.get_username() if user.is_authenticated else None,
+            'verified': user.is_verified() if user.is_authenticated else False,
+        }
+    )
