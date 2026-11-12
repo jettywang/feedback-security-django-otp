@@ -5,8 +5,10 @@ from freezegun import freeze_time
 from django.core import mail
 from django.db import IntegrityError
 from django.test.utils import override_settings
+from django.urls import reverse
 
 from django_otp.forms import OTPAuthenticationForm
+from django_otp.models import ChallengeDisplay
 from django_otp.test_utils import (
     CooldownTestMixin,
     TestCase,
@@ -14,7 +16,7 @@ from django_otp.test_utils import (
     TimestampTestMixin,
 )
 
-from .models import EmailDevice
+from .models import EmailDevice, mask_email
 
 
 class EmailDeviceMixin:
@@ -247,6 +249,95 @@ class EmailTest(EmailDeviceMixin, TestCase):
 
         self.assertEqual(len(mail.outbox), 1)
         self.assertEqual(mail.outbox[0].to, ['alice2@example.com'])
+
+
+@override_settings(
+    OTP_EMAIL_CHALLENGE_HINT=True,
+    OTP_EMAIL_SENDER='test@example.com',
+)
+class ChallengeHintTest(EmailDeviceMixin, TestCase):
+    """
+    With OTP_EMAIL_CHALLENGE_HINT enabled, tokens are still delivered to the
+    user's real address, but public pages (the rendered login form and the
+    failed-verification page) must only show the masked hint and the
+    remaining wait time.
+    """
+
+    def post_login(self, **extra):
+        data = {
+            'username': 'alice',
+            'password': 'password',
+            'otp_device': self.device.persistent_id,
+        }
+        data.update(extra)
+
+        return self.client.post(reverse('login-otp'), data)
+
+    def test_mask_email(self):
+        self.assertEqual(mask_email('alice@example.com'), 'a***@example.com')
+        self.assertEqual(mask_email('a@example.com'), 'a***@example.com')
+        self.assertEqual(mask_email('@example.com'), '***@example.com')
+        self.assertEqual(mask_email('no-at-sign'), '***')
+        self.assertEqual(mask_email(''), '***')
+
+    def test_generate_challenge_returns_display(self):
+        display = self.device.generate_challenge()
+
+        self.assertIsInstance(display, ChallengeDisplay)
+        self.assertEqual(display.hint, 'sent by email to a***@example.com')
+        self.assertEqual(display.retry_after, 60)
+
+    def test_challenge_page_shows_only_masked_hint(self):
+        response = self.post_login(otp_challenge='1')
+
+        self.assertEqual(response.status_code, 200)
+        # The token is actually delivered to the user's real address.
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ['alice@example.com'])
+        self.device.refresh_from_db()
+        self.assertIn(self.device.token, mail.outbox[0].body)
+
+        # The rendered page only shows the masked hint and the wait time.
+        content = response.content.decode()
+        self.assertIn('a***@example.com', content)
+        self.assertIn('in 60 seconds', content)
+        self.assertNotIn('alice@example.com', content)
+
+    def test_rendered_form_shows_only_allowed_hint(self):
+        form = OTPAuthenticationForm(
+            None,
+            {
+                'username': 'alice',
+                'password': 'password',
+                'otp_device': self.device.persistent_id,
+                'otp_challenge': '1',
+            },
+        )
+        self.assertFalse(form.is_valid())
+
+        html = form.as_p()
+        self.assertIn('a***@example.com', html)
+        self.assertIn('in 60 seconds', html)
+        self.assertNotIn('alice@example.com', html)
+
+    def test_failed_verification_page_hides_address(self):
+        self.post_login(otp_challenge='1')
+        response = self.post_login(otp_token='bogus')
+
+        content = response.content.decode()
+        self.assertIn('Invalid token', content)
+        self.assertNotIn('alice@example.com', content)
+
+    def test_cooldown_challenge_shows_remaining_wait_only(self):
+        self.post_login(otp_challenge='1')
+        response = self.post_login(otp_challenge='1')
+
+        content = response.content.decode()
+        self.assertIn('cooldown period has not expired', content)
+        self.assertRegex(content, r'in \d+ seconds')
+        self.assertNotIn('alice@example.com', content)
+        # No second token is delivered during the cooldown.
+        self.assertEqual(len(mail.outbox), 1)
 
 
 @override_settings(

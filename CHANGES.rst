@@ -1,3 +1,15 @@
+Unreleased
+--------------------------------------------------------------------------------
+
+- Add an optional challenge display strategy: devices may return a
+  ``ChallengeDisplay`` (safe hint plus remaining wait time) from
+  ``generate_challenge()`` instead of a plain string, which remains fully
+  supported for third-party plugins.
+- Add :setting:`OTP_EMAIL_CHALLENGE_HINT` to show a masked delivery address
+  and the remaining cooldown wait on public pages instead of a generic
+  message.
+
+
 v1.7.5 - October 16, 2026 - Revoke sessions for unconfirmed devices
 --------------------------------------------------------------------------------
 

@@ -2,8 +2,10 @@ from doctest import DocTestSuite
 from io import StringIO
 import pickle
 from threading import Thread
+from types import SimpleNamespace
 import unittest
 
+from django import forms
 from django.contrib.auth.models import AnonymousUser
 from django.core.management import call_command
 from django.core.management.base import CommandError
@@ -27,6 +29,7 @@ from django_otp.forms import (
     otp_verification_failed,
 )
 from django_otp.middleware import OTPMiddleware
+from django_otp.models import ChallengeDisplay
 from django_otp.plugins.otp_static.models import StaticDevice, StaticToken
 
 from .test_utils import TestCase, TransactionTestCase
@@ -224,6 +227,55 @@ class OTPAuthenticationFormDeviceRequiredTestCase(TestCase):
 
         self.assertTrue(form.is_valid())
         self.assertEqual(form.get_user().otp_device, self.totp_device)
+
+
+class ChallengeDisplayFormTestCase(TestCase):
+    """
+    Devices may opt into returning a ChallengeDisplay from
+    generate_challenge() to control what is shown on public pages (a safe
+    hint plus an optional remaining wait time). Third-party devices that
+    return plain strings must keep working unchanged.
+    """
+
+    def challenge_error(self, challenge):
+        device = SimpleNamespace(generate_challenge=lambda: challenge)
+        form = OTPAuthenticationForm()
+        with self.assertRaises(forms.ValidationError) as caught:
+            form._handle_challenge(device)
+
+        return caught.exception
+
+    def test_string_challenge_unchanged(self):
+        error = self.challenge_error('check your phone')
+
+        self.assertEqual(error.code, 'challenge_message')
+        self.assertEqual(error.message, 'OTP Challenge: check your phone')
+
+    def test_challenge_display_hint(self):
+        error = self.challenge_error(
+            ChallengeDisplay(hint='sent by email to a***@example.com')
+        )
+
+        self.assertEqual(error.code, 'challenge_message')
+        self.assertEqual(
+            error.message, 'OTP Challenge: sent by email to a***@example.com'
+        )
+
+    def test_challenge_display_retry_after(self):
+        error = self.challenge_error(
+            ChallengeDisplay(hint='sent by email to a***@example.com', retry_after=60)
+        )
+
+        self.assertEqual(
+            error.message,
+            'OTP Challenge: sent by email to a***@example.com'
+            ' You may request a new challenge in 60 seconds.',
+        )
+
+    def test_challenge_display_retry_after_singular(self):
+        error = self.challenge_error(ChallengeDisplay(hint='hint', retry_after=1))
+
+        self.assertIn('in 1 second.', error.message)
 
 
 class OTPMiddlewareTestCase(TestCase):

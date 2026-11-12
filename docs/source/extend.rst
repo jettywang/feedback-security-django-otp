@@ -62,6 +62,12 @@ user interaction, it should implement an additional method:
 .. automethod:: django_otp.models.Device.generate_challenge
    :noindex:
 
+Instead of a plain string, the method may return a
+:class:`~django_otp.models.ChallengeDisplay` to control exactly what is shown
+on public pages: a safe hint (such as a masked delivery address) plus an
+optional remaining wait time before another challenge may be requested. Plain
+string return values remain fully supported.
+
 
 Helpers
 -------

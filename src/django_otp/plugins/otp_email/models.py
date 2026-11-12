@@ -1,11 +1,15 @@
+import math
+
 from django.contrib.humanize.templatetags.humanize import naturaltime
 from django.core.mail import send_mail
 from django.db import models
 from django.template import Context, Template
 from django.template.loader import get_template
+from django.utils import timezone
 from django.utils.translation import gettext
 
 from django_otp.models import (
+    ChallengeDisplay,
     CooldownMixin,
     GenerateNotAllowed,
     SideChannelDevice,
@@ -25,6 +29,20 @@ def default_key():  # pragma: no cover
 def key_validator(value):  # pragma: no cover
     """Obsolete code here for migrations."""
     return hex_validator()(value)
+
+
+def mask_email(email):
+    """
+    Masks the local part of an email address so it is safe to show on a
+    public page, e.g. ``alice@example.com`` becomes ``a***@example.com``.
+
+    """
+    local, separator, domain = (email or '').partition('@')
+    if not separator:
+        return '***'
+    masked_local = '{0}***'.format(local[:1]) if local else '***'
+
+    return '{0}@{1}'.format(masked_local, domain)
 
 
 class EmailDevice(TimestampMixin, CooldownMixin, ThrottlingMixin, SideChannelDevice):
@@ -57,6 +75,11 @@ class EmailDevice(TimestampMixin, CooldownMixin, ThrottlingMixin, SideChannelDev
         """
         Generates a random token and emails it to the user.
 
+        If :setting:`OTP_EMAIL_CHALLENGE_HINT` is enabled, this returns a
+        :class:`~django_otp.models.ChallengeDisplay` with a masked delivery
+        address and the remaining wait time instead of a plain string, so
+        that public pages never show the full email address.
+
         :param extra_context: Additional context variables for rendering the
             email template.
         :type extra_context: dict
@@ -65,22 +88,51 @@ class EmailDevice(TimestampMixin, CooldownMixin, ThrottlingMixin, SideChannelDev
         generate_allowed, data_dict = self.generate_is_allowed()
         if generate_allowed:
             message = self._deliver_token(extra_context)
+            if settings.OTP_EMAIL_CHALLENGE_HINT:
+                message = ChallengeDisplay(
+                    hint=gettext("sent by email to %s") % self.get_masked_email(),
+                    retry_after=self.get_cooldown_duration() or None,
+                )
         else:
             if data_dict['reason'] == GenerateNotAllowed.COOLDOWN_DURATION_PENDING:
-                next_generation_naturaltime = naturaltime(
-                    data_dict['next_generation_at']
-                )
-                message = (
-                    gettext(
-                        "Token generation cooldown period has not expired yet. Next"
-                        " generation allowed %s."
+                if settings.OTP_EMAIL_CHALLENGE_HINT:
+                    retry_after = max(
+                        0,
+                        math.ceil(
+                            (
+                                data_dict['next_generation_at'] - timezone.now()
+                            ).total_seconds()
+                        ),
                     )
-                    % next_generation_naturaltime
-                )
+                    message = ChallengeDisplay(
+                        hint=gettext(
+                            "Token generation cooldown period has not expired yet."
+                        ),
+                        retry_after=retry_after,
+                    )
+                else:
+                    next_generation_naturaltime = naturaltime(
+                        data_dict['next_generation_at']
+                    )
+                    message = (
+                        gettext(
+                            "Token generation cooldown period has not expired yet. Next"
+                            " generation allowed %s."
+                        )
+                        % next_generation_naturaltime
+                    )
             else:
                 message = gettext("Token generation is not allowed at this time")
 
         return message
+
+    def get_masked_email(self):
+        """
+        Returns a partially masked version of the delivery address, suitable
+        for display on public pages. See :func:`mask_email`.
+
+        """
+        return mask_email(self.email or self.user.email)
 
     def _deliver_token(self, extra_context):
         self.cooldown_set(commit=False)

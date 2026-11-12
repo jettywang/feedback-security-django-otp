@@ -1,6 +1,8 @@
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import timedelta
 import enum
+from typing import Optional
 
 from django.apps import apps
 from django.conf import settings
@@ -16,6 +18,39 @@ from .util import random_number_token
 # something that's already far longer than any realistic lockout needs to
 # be, rather than let the delay calculation overflow.
 MAX_THROTTLE_DELAY_SECONDS = timedelta(days=365 * 100).total_seconds()
+
+
+@dataclass(frozen=True)
+class ChallengeDisplay:
+    """
+    An optional, structured display strategy for challenge messages.
+
+    Interactive devices may return one of these from
+    :meth:`Device.generate_challenge` instead of a plain string when they want
+    to control exactly what is shown on public pages, such as a login form.
+    This allows a device to offer a safe hint about out-of-band delivery (for
+    example, a partially masked email address) without exposing sensitive
+    information, along with the remaining wait time before a new challenge may
+    be requested.
+
+    Devices that return plain strings are still fully supported; the string is
+    used as the challenge message as before.
+
+    .. attribute:: hint
+
+        A user-facing message that is safe to display on a public page. It
+        should not contain sensitive information such as full delivery
+        addresses or tokens.
+
+    .. attribute:: retry_after
+
+        Optional number of seconds the user should wait before requesting
+        another challenge, e.g. the remainder of a cooldown period.
+
+    """
+
+    hint: str
+    retry_after: Optional[int] = None
 
 
 class DeviceManager(models.Manager):
@@ -203,8 +238,11 @@ class Device(models.Model):
 
         :returns: A message to the user. This should be a string that fits
             comfortably in the template ``'OTP Challenge: {0}'``. This may
-            return ``None`` if this device is not interactive.
-        :rtype: string or ``None``
+            return ``None`` if this device is not interactive. Alternatively,
+            it may return a :class:`ChallengeDisplay` to supply a safe hint
+            and an optional remaining wait time instead of a free-form
+            string.
+        :rtype: string, :class:`ChallengeDisplay`, or ``None``
 
         :raises: Any :exc:`~exceptions.Exception` is permitted. Callers should
             trap ``Exception`` and report it to the user.

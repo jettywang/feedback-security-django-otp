@@ -7,7 +7,7 @@ from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext_lazy
 
 from . import devices_for_user
-from .models import Device, VerifyNotAllowed
+from .models import ChallengeDisplay, Device, VerifyNotAllowed
 
 otp_verification_failed = Signal()
 
@@ -65,6 +65,11 @@ class OTPAuthenticationFormMixin:
         'challenge_exception': _('Error generating challenge: {0}'),
         'not_interactive': _('The selected OTP device is not interactive'),
         'challenge_message': _('OTP Challenge: {0}'),
+        'challenge_retry_after': ngettext_lazy(
+            "You may request a new challenge in %(retry_after)d second.",
+            "You may request a new challenge in %(retry_after)d seconds.",
+            "retry_after",
+        ),
         'invalid_token': _(
             'Invalid token. Please make sure you have entered it correctly.'
         ),
@@ -153,9 +158,35 @@ class OTPAuthenticationFormMixin:
                 )
             else:
                 raise forms.ValidationError(
-                    self.otp_error_messages['challenge_message'].format(challenge),
+                    self._format_challenge(challenge),
                     code='challenge_message',
                 )
+
+    def _format_challenge(self, challenge):
+        """
+        Renders the value returned by ``generate_challenge()`` for display.
+
+        Devices may opt into the structured :class:`~django_otp.models.ChallengeDisplay`
+        strategy to supply a safe hint and a remaining wait time; plain
+        strings from third-party devices are used verbatim, as before.
+
+        """
+        if isinstance(challenge, ChallengeDisplay):
+            hint = challenge.hint
+            retry_after = challenge.retry_after
+        else:
+            hint = challenge
+            retry_after = None
+
+        message = self.otp_error_messages['challenge_message'].format(hint)
+        if retry_after is not None:
+            message = '{0} {1}'.format(
+                message,
+                self.otp_error_messages['challenge_retry_after']
+                % {'retry_after': retry_after},
+            )
+
+        return message
 
     def _verify_token(self, user, token, device=None):
         if device is None:

@@ -514,6 +514,22 @@ This controls the rate of throttling. The sequence of 1, 2, 4, 8… seconds is
 multiplied by this factor to define the delay imposed after 1, 2, 3, 4…
 successive failures. Set to 0 to disable throttling completely.
 
+
+.. setting:: OTP_EMAIL_CHALLENGE_HINT
+
+**OTP_EMAIL_CHALLENGE_HINT**
+
+Default: ``False``
+
+If enabled, :meth:`~django_otp.plugins.otp_email.models.EmailDevice.generate_challenge`
+returns a :class:`~django_otp.models.ChallengeDisplay` instead of a plain
+string. The hint shown on public pages (such as the login form) will include
+a partially masked version of the delivery address (e.g.
+``a***@example.com``) rather than anything that reveals the full address,
+along with the remaining wait time before a new token may be requested.
+Delivery itself is unaffected: tokens are still sent to the user's real
+email address.
+
 .. _other-plugins:
 
 Other Plugins
